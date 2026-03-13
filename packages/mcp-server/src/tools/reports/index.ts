@@ -11,7 +11,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerFieldTools } from "./fields.js";
 import { registerPredictiveTools } from "./predictive.js";
 import { registerSlippageTools } from "./slippage.js";
-import { registerIndicatorBinsTool } from "./indicator-bins.js";
+import { registerIndicatorAnalysisTool } from "./indicator-analysis.js";
 
 /**
  * Register all report-related MCP tools
@@ -20,5 +20,5 @@ export function registerReportTools(server: McpServer, baseDir: string): void {
   registerFieldTools(server, baseDir);
   registerPredictiveTools(server, baseDir);
   registerSlippageTools(server, baseDir);
-  registerIndicatorBinsTool(server, baseDir);
+  registerIndicatorAnalysisTool(server, baseDir);
 }
