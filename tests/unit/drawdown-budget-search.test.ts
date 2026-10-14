@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { searchBookAtDrawdown } from "@tradeblocks/lib";
+import { prepareReplayTape, replayBook, searchBookAtDrawdown } from "@tradeblocks/lib";
+import { createSearchReplay } from "../../packages/lib/calculations/book-replay-prepared";
 import type {
   BookReplayResult,
   BookSearchCheckpoint,
@@ -1492,4 +1493,217 @@ it("applies relative near-optimal tolerance to the magnitude of a negative ratio
   expect(result.objectiveValue).toBe(-1);
   expect(result.nearOptimal.map((e) => e.weights.a)).toEqual([0.5, 1]);
   expect(result.weightRanges.a).toEqual({ min: 0.5, max: 1 });
+});
+
+it("matches fresh complete replays across candidate declarations and resampled tapes", () => {
+  let comparisons = 0;
+  for (const markMode of ["child", "entryGroup"] as const)
+    for (const reservationMode of ["sharedEntryGroup", "sumChildren"] as const)
+      for (const ignoredPolicy of ["omit", "exclude", "reserve"] as const)
+        for (const scheduled of [false, true])
+          for (const loss of [-100, -2000])
+            for (const attribution of [false, true]) {
+              const value = input();
+              value.replay.reservationMode = reservationMode;
+              value.replay.includeFundsAtEntry = true;
+              value.replay.memberMarkedPl = attribution;
+              value.replay.trades[0].netPlPerContract = loss;
+              value.replay.trades[0].dateClosed = "2025-01-03";
+              value.replay.trades.push({
+                ...value.replay.trades[0],
+                id: "ignored",
+                ignored: true,
+              });
+              if (ignoredPolicy !== "omit")
+                value.replay = {
+                  ...value.replay,
+                  ignoredRows: "markOnly",
+                  ignoredBuyingPower: ignoredPolicy,
+                };
+              value.replay.members.b = { ...value.replay.members.a, removed: true };
+              value.replay.simultaneousOrder.push("b");
+              value.weightBounds.b = { min: 0, max: 1 };
+              value.initialWeights = [0, 0.01, 0.5, 1].map((a) => ({ a, b: 1 }));
+              value.targetDrawdownPct = 100;
+              value.robust = { maxDrawdownPct: 100, shrinkageFactors: [1, 0.5] };
+              value.dropOne = true;
+              value.stability.replicates = 2;
+              value.stability.meanBlockDays = 1;
+              value.replay.marks =
+                markMode === "child"
+                  ? {
+                      mode: "child",
+                      values: ["loss", "ignored"].map((tradeId) => ({
+                        tradeId,
+                        date: "2025-01-02",
+                        netOpenPlPerContract: -50,
+                      })),
+                    }
+                  : {
+                      mode: "entryGroup",
+                      values: [
+                        {
+                          memberId: "a",
+                          entryGroupId: "loss",
+                          date: "2025-01-02",
+                          netOpenPlPerContract: -100,
+                        },
+                      ],
+                    };
+              if (scheduled)
+                value.replay.sizingSchedule = {
+                  a: [
+                    { effectiveDate: "2025-01-02", disabled: true },
+                    {
+                      effectiveDate: "2025-01-03",
+                      sizing: { mode: "fixed", contracts: 1 },
+                      maxContractsPerTrade: null,
+                      maxAllocationAmount: null,
+                      maxOpenTrades: 1,
+                    },
+                  ],
+                };
+              const preparedTape = prepareReplayTape(value.replay);
+              value.feasible = (result) => {
+                expect(JSON.stringify(result)).toBe(
+                  JSON.stringify(replayBook(result.declarations)),
+                );
+                comparisons++;
+                return true;
+              };
+              if (scheduled) {
+                const replayCandidate = createSearchReplay(value.replay, preparedTape);
+                for (const contracts of [0, 1, 2, 10]) {
+                  const members = {
+                    ...value.replay.members,
+                    a: { ...value.replay.members.a, sizing: { mode: "fixed" as const, contracts } },
+                  };
+                  value.feasible(replayCandidate(members));
+                }
+                expect(() => searchBookAtDrawdown(value)).toThrow(
+                  "replay.sizingSchedule is not supported",
+                );
+              } else searchBookAtDrawdown(value, { preparedTape });
+            }
+  expect(comparisons).toBeGreaterThan(500);
+});
+
+it("validates every candidate even after tape preparation", () => {
+  const value = input();
+  value.initialWeights = [{ a: 0.5 }, { a: 1 }];
+  value.feasible = () => {
+    value.replay.members.a.maxAllocationAmount = -1;
+    return true;
+  };
+  expect(() => searchBookAtDrawdown(value)).toThrow("Invalid book replay: maxAllocationAmount");
+});
+
+it("reuses a frozen caller-held tape across short searches and refuses mutated invariant inputs", () => {
+  const value = input();
+  const preparedTape = prepareReplayTape(value.replay);
+  expect(Object.isFrozen(preparedTape)).toBe(true);
+  for (const contracts of [0, 1, 2, 5]) {
+    const replay = structuredClone(value.replay);
+    replay.members.a.sizing = { mode: "fixed", contracts };
+    expect(JSON.stringify(replayBook(replay, { preparedTape }))).toBe(
+      JSON.stringify(replayBook(replay)),
+    );
+    expect(JSON.stringify(searchBookAtDrawdown({ ...value, replay }, { preparedTape }))).toBe(
+      JSON.stringify(searchBookAtDrawdown({ ...value, replay })),
+    );
+  }
+  const changes = [
+    (replay: typeof value.replay) => {
+      replay.trades[0].netPlPerContract--;
+    },
+    (replay: typeof value.replay) => {
+      replay.dates.push("2025-01-06");
+    },
+    (replay: typeof value.replay) => {
+      replay.marks = { mode: "child", values: [] };
+    },
+    (replay: typeof value.replay) => {
+      replay.simultaneousGroupOrder = { a: ["win", "loss"] };
+    },
+    (replay: typeof value.replay) => {
+      replay.reservationMode = "sumChildren";
+    },
+  ];
+  for (const change of changes) {
+    const replay = structuredClone(value.replay);
+    change(replay);
+    expect(() => replayBook(replay, { preparedTape })).toThrow("prepared_replay_tape_mismatch");
+    expect(() => searchBookAtDrawdown({ ...value, replay }, { preparedTape })).toThrow(
+      "prepared_replay_tape_mismatch",
+    );
+  }
+  value.replay.trades[0].netPlPerContract = -999;
+  const original = input().replay;
+  expect(JSON.stringify(replayBook(original, { preparedTape }))).toBe(
+    JSON.stringify(replayBook(original)),
+  );
+});
+
+it("exposes no mutable prepared data through reflection on the tape token", () => {
+  const replay = input().replay;
+  const preparedTape = prepareReplayTape(replay);
+  const keys = Reflect.ownKeys(preparedTape);
+  expect(Object.getOwnPropertySymbols(preparedTape)).toEqual(
+    keys.filter((key) => typeof key === "symbol"),
+  );
+  for (const key of keys) {
+    const value = Reflect.get(preparedTape, key);
+    expect(value === null || (typeof value !== "object" && typeof value !== "function")).toBe(true);
+  }
+  expect(JSON.stringify(replayBook(replay, { preparedTape }))).toBe(
+    JSON.stringify(replayBook(replay)),
+  );
+});
+
+it("preserves search validation errors before checking a mismatched tape", () => {
+  const value = input();
+  const preparedTape = prepareReplayTape(value.replay);
+  value.replay.trades[0].netPlPerContract--;
+  value.maxEvaluations = 0;
+  let expected: unknown;
+  try {
+    searchBookAtDrawdown(value);
+  } catch (error) {
+    expected = error;
+  }
+  expect(expected).toBeInstanceOf(RangeError);
+  expect(() => searchBookAtDrawdown(value, { preparedTape })).toThrow((expected as Error).message);
+  expect(() => searchBookAtDrawdown(value, { preparedTape, checkpoint: true })).toThrow(
+    (expected as Error).message,
+  );
+});
+
+it("leaves ordinary replay and new handles available after conservative tape refusal", () => {
+  const value = input();
+  const preparedTape = prepareReplayTape(value.replay);
+  for (const patch of [
+    { ignoredRows: "exclude" as const },
+    { liquidityThresholdContracts: 100 },
+    { reservationMode: "sumChildren" as const },
+  ]) {
+    const replay = {
+      ...value.replay,
+      ignoredRows: undefined,
+      ignoredBuyingPower: undefined,
+      ...patch,
+    };
+    const fresh = replayBook(replay);
+    expect(() => replayBook(replay, { preparedTape })).toThrow("prepared_replay_tape_mismatch");
+    expect(JSON.stringify(replayBook(replay, { preparedTape: prepareReplayTape(replay) }))).toBe(
+      JSON.stringify(fresh),
+    );
+    expect(() => searchBookAtDrawdown({ ...value, replay }, { preparedTape })).toThrow(
+      "prepared_replay_tape_mismatch",
+    );
+    expect(
+      JSON.stringify(
+        searchBookAtDrawdown({ ...value, replay }, { preparedTape: prepareReplayTape(replay) }),
+      ),
+    ).toBe(JSON.stringify(searchBookAtDrawdown({ ...value, replay })));
+  }
 });

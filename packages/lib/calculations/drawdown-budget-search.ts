@@ -1,5 +1,10 @@
-import { replayBook } from "./book-replay.ts";
-import type { BookReplayInput, BookMember, BookReplayResult } from "./book-replay.ts";
+import { createSearchReplay } from "./book-replay-prepared.ts";
+import type {
+  BookReplayInput,
+  BookMember,
+  BookReplayResult,
+  PreparedReplayTape,
+} from "./book-replay.ts";
 import { resampleStationaryBlocks } from "./monte-carlo.ts";
 
 type SearchObjective = "returnPct" | "returnOverDrawdown";
@@ -134,6 +139,7 @@ export interface BookSearchProgress {
 }
 
 export interface BookSearchOptions {
+  preparedTape?: PreparedReplayTape;
   onProgress?: (event: BookSearchProgress) => void;
   /** Return a final checkpoint even without a progress observer. */
   checkpoint?: boolean;
@@ -227,7 +233,8 @@ export function searchBookAtDrawdown(
   input: DrawdownBudgetSearchInput<SearchObjective>,
   options?: BookSearchOptions,
 ): DrawdownBudgetSearchResult<SearchObjective> {
-  if (!options?.onProgress && !options?.checkpoint && !options?.resumeFrom) return runSearch(input);
+  if (!options?.onProgress && !options?.checkpoint && !options?.resumeFrom)
+    return runSearch(input, undefined, "root", undefined, options?.preparedTape);
   if (input.feasible && !options.feasibleId)
     throw new RangeError("search_checkpoint_constraint_identity: feasibleId is required");
   const { feasible, ...economicRequest } = input;
@@ -248,7 +255,7 @@ export function searchBookAtDrawdown(
     cursor: 0,
     onProgress: options.onProgress,
   };
-  const result = runSearch(input, execution);
+  const result = runSearch(input, execution, "root", undefined, options.preparedTape);
   if (execution.cursor !== execution.checkpoint.evaluations.length)
     throw new RangeError("search_checkpoint_invalid: unused evaluations");
   result.checkpoint = structuredClone(execution.checkpoint);
@@ -259,8 +266,11 @@ function runSearch(
   input: DrawdownBudgetSearchInput<SearchObjective>,
   execution?: SearchExecution,
   scope = "root",
+  replayCandidate?: (members: Record<string, BookMember>) => BookReplayResult,
+  preparedTape?: PreparedReplayTape,
 ): DrawdownBudgetSearchResult<SearchObjective> {
   validateSearch(input);
+  const runReplayCandidate = replayCandidate ?? createSearchReplay(input.replay, preparedTape);
   const ratio = input.objective === "returnOverDrawdown";
   const better = (a: BookSearchEvaluation, b: BookSearchEvaluation) =>
     compareObjective(a, b, ratio) > 0;
@@ -341,7 +351,7 @@ function runSearch(
     } else {
       let replay: BookReplayResult;
       try {
-        replay = replayBook({ ...input.replay, members });
+        replay = runReplayCandidate(members);
       } catch (error) {
         if (
           execution &&
@@ -557,6 +567,7 @@ function runSearch(
         },
         execution,
         `dropOne/${id}`,
+        runReplayCandidate,
       );
       dropOne.push({
         memberId: id,
