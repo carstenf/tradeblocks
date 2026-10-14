@@ -311,6 +311,45 @@ Effective dates need not appear on the replay's `dates` axis.
 Omitting the schedule preserves existing output. This is a library-only option,
 not an MCP tool argument.
 
+`walkForwardBook({ input, folds, fit, policies, initialRules? })` is a pure
+multi-member walk-forward calculation. Its caller supplies the fit recipe;
+the callback receives only the declared training sessions strictly before each
+fold origin. Future closes are replaced by an out-of-axis close with zero P/L,
+and future marks are removed. Already-known marks on still-open positions remain
+available. No provider, file, profile or strategy classification is read.
+Supply prior-day values for any close-derived fields before constructing a tape.
+
+Each available fit supplies complete sizing/caps or an explicit disabled rule
+for every member. An unavailable fit carries the last available rules with its
+reason and `carriedFrom`; before any available fit, it carries `initialRules`
+when declared, otherwise exact base sizing. The base still applies before the
+first origin. `initialRules` is echoed separately, never applied retrospectively.
+The frozen schedule is replayed as one continuous real-member ledger per policy,
+with separate prepared handles. Held positions retain quantities, reservations
+and funds across folds. Participation separates `scheduled-disabled`,
+`active-zero` and `active-participating` entries, both overall and per fold.
+The result says **offline screening, not OO evidence**.
+
+`fitBookAtEqualRisk(training, recipe, previous?)` is the optional public, book-generic
+marked-DD recipe: standalone risk references, a caller-declared common-factor
+return search, significant-figure rounding and bounded repair. All domains,
+targets, reference capital, refinement spans and repair limits are declared by
+the caller. Member caps stay fixed. Both ignored-BP hypotheses must pass
+participation and the training budget. The trial ledger separates direct replays,
+search evaluations, reference candidate arms, fits and repairs; reference arms
+are not claimed as hidden helper replay counts. The runner defines no universal
+qualification, hindsight target or study scoring windows.
+
+The recipe requires `noTrainingEntries: "unavailable" | "carry-member"`; there
+is no default. `"unavailable"` retains whole-book failure when a member has no
+training-window entries. `"carry-member"` fits the remaining members and
+preserves each entry-empty member's exact prior rule, supplied as `previous`.
+Every unavailable fold names its affected members and reasons. Partial fits
+record each carried member, its prior rule and carry source separately from a
+whole-fold carry. The fit budget excludes carried members. Replayed drawdown
+under both policies measures the combined schedule, which may exceed that budget;
+the recipe does not re-solve or silently scale the combined schedule.
+
 Optional `includeFundsAtEntry: true` adds `fundsAtEntry` to each member's
 `contractsPerEntry` entry, including zero-quantity and disabled attempts. Disabled
 entries report the closed funds available at that attempted entry, without sizing
