@@ -445,6 +445,64 @@ Examples:
 | `import_from_api { target_table: "intraday", ticker: "SPX", timespan: "1m", from, to }` | `fetch_bars { tickers: ["SPX"], timespan: "1m", from, to }`                                                                |
 | `import_from_api { target_table: "date_context", from, to }`                            | `fetch_bars { tickers: ["VIX","VIX9D","VIX3M"], timespan: "1d", from, to }` followed by `compute_vix_context { from, to }` |
 
+## Quote-partition writes and shrink protection
+
+Parquet minute quotes share one file per `(underlying, date)`:
+`market/option_quote_minutes/underlying=X/date=YYYY-MM-DD/data.parquet`.
+`ParquetQuoteStore.writeQuotes(underlying, date, quotes)`, including per-ticker
+`fetch_quotes`, replaces **all minutes for exactly the tickers present in the
+incoming batch**, not the entire date. Every existing row for another ticker
+is retained, including stored prices, timestamps, Greeks and source/rate
+provenance. Retained legacy DOUBLE Greeks are not rounded to REAL. Incoming
+Greeks are staged as REAL; when retained rows carry legacy DOUBLE Greeks,
+the merged file widens incoming Greeks to DOUBLE. Retained values are always
+exact. Empty `writeQuotes` batches are no-ops.
+
+Supply a complete ticker-date batch: a later batch for the same ticker
+replaces that ticker's earlier minutes rather than appending to them. Bulk
+ingestion collects a complete underlying-date batch before writing. Per-ticker
+`fetch_quotes` also accumulates accepted rows across its requested tickers.
+After each complete ticker, it flushes and clears all pending partitions when
+their accepted rows reach `PENDING_QUOTE_FLUSH_ROW_THRESHOLD = 32,768`; the
+final flush publishes whatever remains, including earlier successful tickers
+when a later provider request fails. Pending rows are bounded by the threshold
+plus one ticker's accepted batch, not a strict hard cap: a single ticker is
+still collected whole. A 79-ticker, 391-minute date (30,889 rows) stays in one
+publication; larger requests may publish the same partition in several
+flushes, retaining tickers from previous flushes through merge-on-write.
+Repeated ticker arguments retain the last accepted batch without duplicating
+stored rows. A fresh partition requires no merge read.
+
+Quote-partition writes use read-merge-replace without a per-partition lock;
+callers must serialize concurrent writers to the same `(underlying, date)`.
+
+In contrast, Parquet `writeFromSelect`, used by `import_flat_file` for
+`option_quotes`, intentionally replaces the **whole partition** with the
+selected rows. Use a complete underlying-date selection for that entrance.
+The DuckDB adapter uses keyed `INSERT OR REPLACE`; it does not delete other
+contracts or minutes absent from its input.
+
+Both Parquet entrances publish through `writeQuoteMinutesPartition`, retaining
+canonical columns, `(ticker, time)` ordering, atomic replacement and existing
+provenance recording. The atomic writer privately guards quote publications:
+`MIN_QUOTE_PARTITION_ROW_FRACTION = 0.5` refuses a candidate with fewer than
+half the existing rows. Exactly half is accepted. This catches large
+accidental truncations while allowing smaller corrections; it is not proof
+that a day's coverage is complete.
+
+Refusal throws `QuotePartitionShrinkError`, whose message names the underlying
+and date, existing row count, candidate row count and threshold. It happens
+before file replacement or provenance publication; the existing file remains
+unchanged and the prepared sidecar is removed. There is no force option.
+The check compares row counts, not compressed bytes, and applies even to tiny
+partitions. Fresh/empty partitions and growth from any size are allowed, so
+full-day imports can restore a truncated partition. An empty `writeFromSelect`
+refuses against any nonempty partition. Other datasets, including spot
+partitions, are unaffected.
+If the existing partition file is unreadable, both write entrances refuse with
+the underlying DuckDB error and leave the file untouched; move the corrupt
+file aside before re-importing that date.
+
 ## Quote-store read projections
 
 Quote-price-only consumers can skip Greek columns entirely. The exported
