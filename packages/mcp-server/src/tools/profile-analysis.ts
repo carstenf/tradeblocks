@@ -15,13 +15,27 @@ import type { Trade } from "@tradeblocks/lib";
 import { getConnection } from "../db/connection.ts";
 import { getProfile, listProfiles } from "../db/profile-schemas.ts";
 import { filterByStrategy } from "./shared/filters.ts";
-import { buildLookaheadFreeQuery, type MarketLookupKey } from "../utils/field-timing.ts";
+import {
+  buildLookaheadFreeQuery,
+  type MarketLookupKey,
+  OPEN_KNOWN_FIELDS,
+  CLOSE_KNOWN_FIELDS,
+  STATIC_FIELDS,
+} from "../utils/field-timing.ts";
 import { DEFAULT_MARKET_TICKER, marketTickerDateKey, resolveTradeTicker } from "../utils/ticker.ts";
 import { computeSliceStats, type SliceStats } from "../utils/analysis-stats.ts";
 import { buildFilterPredicate, type FilterPredicate } from "../utils/filter-predicates.ts";
 import { withSyncedBlock } from "./middleware/sync-middleware.ts";
 import { upgradeToReadWrite, downgradeToReadOnly, getConnectionMode } from "../db/connection.ts";
 import { syncAllBlocks } from "../sync/index.ts";
+import type { EntryFilter } from "../models/strategy-profile.ts";
+import {
+  listDatasets,
+  resolveTradeDatasets,
+  runtimeFieldCatalog,
+  summarizeDatasetAge,
+  datasetAgeOutput,
+} from "../db/dataset-schemas.ts";
 
 // =============================================================================
 // Utility Functions (local to this module)
@@ -94,7 +108,8 @@ function recordsByTickerDate(
 
 function getNum(record: Record<string, unknown>, field: string): number {
   const val = record[field];
-  if (val === null || val === undefined) return NaN;
+  if (val === null || val === undefined || (typeof val === "string" && val.trim() === ""))
+    return NaN;
   if (typeof val === "bigint") return Number(val);
   return val as number;
 }
@@ -149,12 +164,44 @@ function getTimeBucket(timeOpened: string | undefined): string | null {
  * Safely get a raw value from a record.
  */
 function getRaw(record: Record<string, unknown>, field: string): unknown {
-  return record[field];
+  const value = record[field];
+  return value === null ||
+    value === undefined ||
+    (typeof value === "string" && value.trim() === "") ||
+    (typeof value === "number" && !Number.isFinite(value))
+    ? undefined
+    : value;
 }
 
-interface TradeWithMarket {
+interface TradeWithFields {
   trade: Trade;
   market: Record<string, unknown>;
+  builtIn: Record<string, unknown> | undefined;
+  provenance: Record<string, { sourceTimestamp: string; availableAt: string }>;
+}
+
+function partitionMarketFilters(entryFilters: EntryFilter[], catalog: { field: string }[]) {
+  const filters: EntryFilter[] = [];
+  const unresolvable: { field: string; reason: string }[] = [];
+  for (const filter of entryFilters) {
+    if (filter.source === "execution") continue;
+    const field = filter.field;
+    if (
+      catalog.some((entry) => entry.field === field) ||
+      OPEN_KNOWN_FIELDS.has(field) ||
+      CLOSE_KNOWN_FIELDS.has(field) ||
+      STATIC_FIELDS.has(field) ||
+      (field.startsWith("prev_") && CLOSE_KNOWN_FIELDS.has(field.slice(5)))
+    ) {
+      filters.push(filter);
+    } else {
+      unresolvable.push({ field, reason: "unknown market field; not available to this tool" });
+    }
+  }
+  const warnings = unresolvable.map(
+    ({ field, reason }) => `Market filter '${field}' excluded: ${reason}.`,
+  );
+  return { filters, unresolvable, warnings };
 }
 
 /**
@@ -166,7 +213,7 @@ async function loadTradesAndMarket(
   blockId: string,
   strategyName: string,
 ): Promise<{
-  matched: TradeWithMarket[];
+  rows: TradeWithFields[];
   unmatchedCount: number;
   allTrades: Trade[];
 }> {
@@ -184,7 +231,7 @@ async function loadTradesAndMarket(
   }
 
   if (trades.length === 0) {
-    return { matched: [], unmatchedCount: 0, allTrades: [] };
+    return { rows: [], unmatchedCount: 0, allTrades: [] };
   }
 
   // Collect unique trade keys for market query
@@ -196,37 +243,49 @@ async function loadTradesAndMarket(
   const result = await conn.runAndReadAll(sql, params);
   const marketRecords = resultToRecords(result);
   const marketMap = recordsByTickerDate(marketRecords);
+  const datasets = await listDatasets(conn);
+  const datasetMatches = trades.map((trade) => resolveTradeDatasets(datasets, trade));
 
-  // Match trades to market records
-  const matched: TradeWithMarket[] = [];
+  // Preserve built-in coverage separately from the per-field joined values.
+  const rows: TradeWithFields[] = [];
   let unmatchedCount = 0;
 
-  for (const trade of trades) {
+  for (const [index, trade] of trades.entries()) {
     const lookup = getTradeLookupKey(trade);
     const key = marketTickerDateKey(lookup.ticker, lookup.date);
-    const market = marketMap.get(key);
-    if (market) {
-      matched.push({ trade, market });
-    } else {
-      unmatchedCount++;
-    }
+    const datasetValues = datasetMatches[index].values;
+    const builtIn = marketMap.get(key);
+    rows.push({
+      trade,
+      builtIn,
+      market: { ...builtIn, ...datasetValues },
+      provenance: datasetMatches[index].provenance,
+    });
+    if (!builtIn) unmatchedCount++;
   }
 
-  return { matched, unmatchedCount, allTrades: trades };
+  return {
+    rows,
+    unmatchedCount,
+    allTrades: trades,
+  };
 }
 
 /**
  * Create numeric bucket labels from data values.
  * Divides sorted values into ~4 quartile-based ranges.
  */
-function createNumericBuckets(values: number[]): { label: string; min: number; max: number }[] {
+function createNumericBuckets(
+  values: number[],
+  preserveScale = false,
+): { label: string; min: number; max: number }[] {
   if (values.length === 0) return [];
   const sorted = [...values].sort((a, b) => a - b);
 
   const uniqueValues = [...new Set(sorted)];
   if (uniqueValues.length <= 4) {
     return uniqueValues.map((v) => ({
-      label: String(Math.round(v * 100) / 100),
+      label: String(preserveScale ? v : Math.round(v * 100) / 100),
       min: v,
       max: v,
     }));
@@ -240,7 +299,7 @@ function createNumericBuckets(values: number[]): { label: string; min: number; m
     if (start > sorted.length - 1) break;
     const min = sorted[start];
     const max = sorted[end];
-    const r = (n: number) => Math.round(n * 100) / 100;
+    const r = (n: number) => (preserveScale ? n : Math.round(n * 100) / 100);
     buckets.push({
       label: min === max ? `${r(min)}` : `${r(min)} to ${r(max)}`,
       min,
@@ -296,13 +355,35 @@ export async function handleAnalyzeStructureFit(
   }
 
   // Load trades + market data
-  const { matched, unmatchedCount, allTrades } = await loadTradesAndMarket(
+  const { rows, unmatchedCount, allTrades } = await loadTradesAndMarket(
     baseDir,
     blockId,
     strategyName,
   );
 
-  const warnings: string[] = [];
+  const catalog = await runtimeFieldCatalog(conn);
+  const marketFilters = partitionMarketFilters(profile.entryFilters, catalog);
+  const datasetFields = marketFilters.filters
+    .filter((filter) => filter.field.includes("."))
+    .map((filter) => filter.field);
+  const matched = rows.filter(
+    (row) => row.builtIn || datasetFields.some((field) => getRaw(row.market, field) !== undefined),
+  );
+  const datasetAge = summarizeDatasetAge(allTrades, rows);
+  const warnings: string[] = [...marketFilters.warnings];
+  const uncovered = marketFilters.filters
+    .filter(
+      (filter) =>
+        filter.field.includes(".") &&
+        !rows.some(({ market }) => market[filter.field] !== undefined),
+    )
+    .map((filter) => filter.field);
+  if (uncovered.length)
+    return createToolOutput(`Uncovered dataset fields: ${uncovered.join(", ")}`, {
+      error: "uncovered_fields",
+      fields: uncovered,
+      warnings,
+    });
 
   if (allTrades.length === 0) {
     return createToolOutput(
@@ -313,7 +394,7 @@ export async function handleAnalyzeStructureFit(
 
   if (unmatchedCount > 0) {
     warnings.push(
-      `${unmatchedCount} of ${allTrades.length} trades had no matching market data and were excluded from market-based analysis.`,
+      `${unmatchedCount} of ${allTrades.length} trades had no matching market data. Built-in market dimensions cannot use those rows.`,
     );
   }
 
@@ -330,10 +411,11 @@ export async function handleAnalyzeStructureFit(
 
   // Dimension analysis
   const dimensions: Record<string, Record<string, SliceStats>> = {};
+  const dimensionBaselines: Record<string, SliceStats> = {};
 
   // --- Fixed dimension: Vol_Regime ---
   const volRegimeBuckets: Record<string, number[]> = {};
-  for (const { trade, market } of matched) {
+  for (const { trade, market } of rows) {
     const val = getNum(market, "prev_Vol_Regime");
     if (isNaN(val)) continue;
     const label = VOL_REGIME_LABELS[val] || `regime_${val}`;
@@ -345,10 +427,11 @@ export async function handleAnalyzeStructureFit(
     volRegimeStats[label] = computeSliceStats(pls);
   }
   dimensions["Vol_Regime"] = volRegimeStats;
+  dimensionBaselines["Vol_Regime"] = computeSliceStats(Object.values(volRegimeBuckets).flat());
 
   // --- Fixed dimension: day_of_week ---
   const dowBuckets: Record<string, number[]> = {};
-  for (const { trade, market } of matched) {
+  for (const { trade, market } of rows) {
     const val = getNum(market, "Day_of_Week");
     if (isNaN(val)) continue;
     const label = DAY_LABELS[val] || `day_${val}`;
@@ -360,10 +443,11 @@ export async function handleAnalyzeStructureFit(
     dowStats[label] = computeSliceStats(pls);
   }
   dimensions["day_of_week"] = dowStats;
+  dimensionBaselines["day_of_week"] = computeSliceStats(Object.values(dowBuckets).flat());
 
   // --- Fixed dimension: time_of_day ---
   const todBuckets: Record<string, number[]> = {};
-  for (const { trade } of matched) {
+  for (const { trade } of rows) {
     const bucket = getTimeBucket(trade.timeOpened);
     if (!bucket) continue;
     if (!todBuckets[bucket]) todBuckets[bucket] = [];
@@ -374,26 +458,47 @@ export async function handleAnalyzeStructureFit(
     todStats[label] = computeSliceStats(pls);
   }
   dimensions["time_of_day"] = todStats;
+  dimensionBaselines["time_of_day"] = computeSliceStats(Object.values(todBuckets).flat());
 
   // --- Profile-derived dimensions from entry_filters (market-source only) ---
-  for (const filter of profile.entryFilters.filter((f) => f.source !== "execution")) {
-    const predicate = buildFilterPredicate(filter);
+  for (const filter of marketFilters.filters) {
+    const predicate = buildFilterPredicate(filter, catalog);
     const fieldKey = predicate.fieldKey;
+    if (catalog.find((entry) => entry.field === filter.field)?.type === "categorical") {
+      const groups = new Map<string, number[]>();
+      for (const { trade, market } of rows) {
+        const value = getRaw(market, fieldKey);
+        if (value === undefined || value === null) continue;
+        const label = String(value);
+        const pls = groups.get(label) ?? [];
+        pls.push(trade.pl);
+        groups.set(label, pls);
+      }
+      dimensions[filter.field] = Object.fromEntries(
+        [...groups].map(([label, pls]) => [label, computeSliceStats(pls)]),
+      );
+      dimensionBaselines[filter.field] = computeSliceStats([...groups.values()].flat());
+      continue;
+    }
 
-    // Collect numeric values for this field from matched trades
+    // Collect only observed numeric values for this dimension.
     const fieldValues: { val: number; pl: number }[] = [];
-    for (const { trade, market } of matched) {
+    for (const { trade, market } of rows) {
       const raw = getRaw(market, fieldKey);
       if (raw === null || raw === undefined) continue;
       const num = Number(raw);
       if (isNaN(num)) continue;
       fieldValues.push({ val: num, pl: trade.pl });
     }
+    dimensionBaselines[filter.field] = computeSliceStats(fieldValues.map(({ pl }) => pl));
 
     if (fieldValues.length === 0) continue;
 
     // Create buckets from the data
-    const buckets = createNumericBuckets(fieldValues.map((f) => f.val));
+    const buckets = createNumericBuckets(
+      fieldValues.map((f) => f.val),
+      filter.field.includes("."),
+    );
     if (buckets.length === 0) continue;
 
     const filterBuckets: Record<string, number[]> = {};
@@ -428,19 +533,19 @@ export async function handleAnalyzeStructureFit(
   // Check Vol_Regime performance vs overall
   for (const [label, stats] of Object.entries(volRegimeStats)) {
     if (stats.tradeCount >= minTrades) {
-      const winRateDiff = stats.winRate - overall.winRate;
+      const winRateDiff = stats.winRate - dimensionBaselines["Vol_Regime"].winRate;
       if (winRateDiff >= 20) {
         profileUpdateHints.push({
           field: "expectedRegimes",
           suggested: label,
-          reason: `Win rate ${stats.winRate.toFixed(1)}% in ${label} is ${winRateDiff.toFixed(1)}pp above overall ${overall.winRate.toFixed(1)}%`,
+          reason: `Win rate ${stats.winRate.toFixed(1)}% in ${label} is ${winRateDiff.toFixed(1)}pp above its covered baseline ${dimensionBaselines["Vol_Regime"].winRate.toFixed(1)}%`,
         });
       }
       if (winRateDiff <= -20) {
         profileUpdateHints.push({
           field: "expectedRegimes",
           suggested: `avoid_${label}`,
-          reason: `Win rate ${stats.winRate.toFixed(1)}% in ${label} is ${Math.abs(winRateDiff).toFixed(1)}pp below overall ${overall.winRate.toFixed(1)}%`,
+          reason: `Win rate ${stats.winRate.toFixed(1)}% in ${label} is ${Math.abs(winRateDiff).toFixed(1)}pp below its covered baseline ${dimensionBaselines["Vol_Regime"].winRate.toFixed(1)}%`,
         });
       }
     }
@@ -449,12 +554,12 @@ export async function handleAnalyzeStructureFit(
   // Check day_of_week for stark differences
   for (const [label, stats] of Object.entries(dowStats)) {
     if (stats.tradeCount >= minTrades) {
-      const winRateDiff = stats.winRate - overall.winRate;
+      const winRateDiff = stats.winRate - dimensionBaselines["day_of_week"].winRate;
       if (Math.abs(winRateDiff) >= 20) {
         profileUpdateHints.push({
           field: "day_of_week",
           suggested: winRateDiff > 0 ? `favor_${label}` : `avoid_${label}`,
-          reason: `Win rate ${stats.winRate.toFixed(1)}% on ${label} vs overall ${overall.winRate.toFixed(1)}%`,
+          reason: `Win rate ${stats.winRate.toFixed(1)}% on ${label} vs its covered baseline ${dimensionBaselines["day_of_week"].winRate.toFixed(1)}%`,
         });
       }
     }
@@ -463,12 +568,12 @@ export async function handleAnalyzeStructureFit(
   // Check time_of_day for stark differences
   for (const [label, stats] of Object.entries(todStats)) {
     if (stats.tradeCount >= minTrades) {
-      const winRateDiff = stats.winRate - overall.winRate;
+      const winRateDiff = stats.winRate - dimensionBaselines["time_of_day"].winRate;
       if (Math.abs(winRateDiff) >= 20) {
         profileUpdateHints.push({
           field: "time_of_day",
           suggested: winRateDiff > 0 ? `favor_${label}` : `avoid_${label}`,
-          reason: `Win rate ${stats.winRate.toFixed(1)}% during ${label} vs overall ${overall.winRate.toFixed(1)}%`,
+          reason: `Win rate ${stats.winRate.toFixed(1)}% during ${label} vs its covered baseline ${dimensionBaselines["time_of_day"].winRate.toFixed(1)}%`,
         });
       }
     }
@@ -476,12 +581,18 @@ export async function handleAnalyzeStructureFit(
 
   // Summary text
   const dimNames = Object.keys(dimensions).join(", ");
-  const summaryText = `Structure fit analysis for '${strategyName}': ${matched.length} trades analyzed across ${Object.keys(dimensions).length} dimensions (${dimNames}). Overall win rate: ${overall.winRate.toFixed(1)}%, avg P&L: $${overall.avgPl.toFixed(2)}. ${profileUpdateHints.length} update hint(s).`;
+  const summaryText = `Structure fit analysis for '${strategyName}': ${matched.length} baseline trades across ${Object.keys(dimensions).length} dimensions (${dimNames}). Overall win rate: ${overall.winRate.toFixed(1)}%, avg P&L: $${overall.avgPl.toFixed(2)}. ${profileUpdateHints.length} update hint(s). ${marketFilters.warnings.join(" ")}`;
 
   return createToolOutput(summaryText, {
     overall,
     dimensions,
+    dimension_baselines: dimensionBaselines,
+    ...datasetAgeOutput(
+      datasetAge,
+      marketFilters.filters.map((filter) => filter.field),
+    ),
     profile_update_hints: profileUpdateHints,
+    unresolvable_filters: marketFilters.unresolvable,
     warnings,
     profile: {
       strategyName: profile.strategyName,
@@ -550,14 +661,44 @@ export async function handleValidateEntryFilters(
     );
   }
 
+  const catalog = await runtimeFieldCatalog(conn);
+  const { filters, unresolvable, warnings } = partitionMarketFilters(marketFilters, catalog);
+  if (filters.length === 0) {
+    return createToolOutput(
+      `No resolvable market filters for '${strategyName}': ${warnings.join(" ")}`,
+      { error: "no_resolvable_filters", unresolvable_filters: unresolvable, warnings },
+    );
+  }
+
   // Load trades + market data
-  const { matched, unmatchedCount, allTrades } = await loadTradesAndMarket(
+  const { rows, unmatchedCount, allTrades } = await loadTradesAndMarket(
     baseDir,
     blockId,
     strategyName,
   );
-
-  const warnings: string[] = [];
+  const predicates: FilterPredicate[] = filters.map((filter) =>
+    buildFilterPredicate(filter, catalog),
+  );
+  const matched = rows.filter(({ market }) =>
+    predicates.every((predicate) => predicate.hasData(market)),
+  );
+  const datasetAge = summarizeDatasetAge(
+    matched.map(({ trade }) => trade),
+    matched,
+  );
+  const uncovered = filters
+    .filter(
+      (filter) =>
+        filter.field.includes(".") &&
+        !rows.some(({ market }) => market[filter.field] !== undefined),
+    )
+    .map((filter) => filter.field);
+  if (uncovered.length)
+    return createToolOutput(`Uncovered dataset fields: ${uncovered.join(", ")}`, {
+      error: "uncovered_fields",
+      fields: uncovered,
+      warnings,
+    });
 
   if (executionFilters.length > 0) {
     warnings.push(
@@ -574,22 +715,22 @@ export async function handleValidateEntryFilters(
 
   if (unmatchedCount > 0) {
     warnings.push(
-      `${unmatchedCount} of ${allTrades.length} trades had no matching market data and were excluded.`,
+      `${unmatchedCount} of ${allTrades.length} trades had no matching market data. Dataset fields are evaluated independently.`,
     );
   }
 
   if (matched.length === 0) {
     return createToolOutput(
-      `No trades could be matched to market data for strategy '${strategyName}'.`,
-      { error: "no_market_match", warnings },
+      `No trades have observations for all requested filters in '${strategyName}': ${filters.map((filter) => `${filter.field} ${filter.operator} ${JSON.stringify(filter.value)}`).join(", ")}.`,
+      {
+        error: "no_market_match",
+        fields: predicates.flatMap((predicate) => predicate.fields),
+        warnings,
+      },
     );
   }
 
-  // Build predicates for market-testable filters only
-  const filters = marketFilters;
-  const predicates: FilterPredicate[] = filters.map((f) => buildFilterPredicate(f));
-
-  // No-filters baseline: all matched trades
+  // Every comparison and ablation uses the same pool covered by all requested filters.
   const noFiltersPls = matched.map((m) => m.trade.pl);
   const noFiltersStats = computeSliceStats(noFiltersPls);
 
@@ -607,14 +748,12 @@ export async function handleValidateEntryFilters(
 
     const enteredPls: number[] = [];
     const filteredOutPls: number[] = [];
-    let noDataCount = 0;
+    const noDataCount = rows.reduce(
+      (count, { market }) => count + Number(!predicate.hasData(market)),
+      0,
+    );
 
     for (const { trade, market } of matched) {
-      const raw = getRaw(market, predicate.fieldKey);
-      if (raw === null || raw === undefined) {
-        noDataCount++;
-        continue;
-      }
       if (predicate.test(market)) {
         enteredPls.push(trade.pl);
       } else {
@@ -634,19 +773,13 @@ export async function handleValidateEntryFilters(
   const baselinePls: number[] = [];
   for (const { trade, market } of matched) {
     let passesAll = true;
-    let hasData = true;
     for (const predicate of predicates) {
-      const raw = getRaw(market, predicate.fieldKey);
-      if (raw === null || raw === undefined) {
-        hasData = false;
-        break;
-      }
       if (!predicate.test(market)) {
         passesAll = false;
         break;
       }
     }
-    if (hasData && passesAll) {
+    if (passesAll) {
       baselinePls.push(trade.pl);
     }
   }
@@ -662,20 +795,14 @@ export async function handleValidateEntryFilters(
     const pls: number[] = [];
     for (const { trade, market } of matched) {
       let passesRemaining = true;
-      let hasData = true;
       for (let j = 0; j < predicates.length; j++) {
         if (j === skip) continue;
-        const raw = getRaw(market, predicates[j].fieldKey);
-        if (raw === null || raw === undefined) {
-          hasData = false;
-          break;
-        }
         if (!predicates[j].test(market)) {
           passesRemaining = false;
           break;
         }
       }
-      if (hasData && passesRemaining) {
+      if (passesRemaining) {
         pls.push(trade.pl);
       }
     }
@@ -698,20 +825,14 @@ export async function handleValidateEntryFilters(
         const pls: number[] = [];
         for (const { trade, market } of matched) {
           let passesRemaining = true;
-          let hasData = true;
           for (let k = 0; k < predicates.length; k++) {
             if (k === i || k === j) continue;
-            const raw = getRaw(market, predicates[k].fieldKey);
-            if (raw === null || raw === undefined) {
-              hasData = false;
-              break;
-            }
             if (!predicates[k].test(market)) {
               passesRemaining = false;
               break;
             }
           }
-          if (hasData && passesRemaining) {
+          if (passesRemaining) {
             pls.push(trade.pl);
           }
         }
@@ -775,12 +896,17 @@ export async function handleValidateEntryFilters(
   // Summary text
   const execNote =
     executionFilters.length > 0 ? ` (${executionFilters.length} execution filter(s) skipped)` : "";
-  const summaryText = `Filter validation for '${strategyName}': ${filters.length} market filter(s) analyzed across ${matched.length} trades${execNote}. Baseline (all market filters): ${baseline.tradeCount} trades, win rate ${baseline.winRate.toFixed(1)}%, avg P&L $${baseline.avgPl.toFixed(2)}. ${profileUpdateHints.length} update hint(s).`;
+  const summaryText = `Filter validation for '${strategyName}': ${filters.length} market filter(s) analyzed across ${matched.length} trades${execNote}. Baseline (resolvable market filters): ${baseline.tradeCount} trades, win rate ${baseline.winRate.toFixed(1)}%, avg P&L $${baseline.avgPl.toFixed(2)}. ${profileUpdateHints.length} update hint(s). ${unresolvable.length > 0 ? warnings.slice(0, unresolvable.length).join(" ") : ""}`;
 
   return createToolOutput(summaryText, {
     baseline,
     no_filters: noFiltersStats,
     per_filter: perFilter,
+    ...datasetAgeOutput(
+      datasetAge,
+      predicates.flatMap((predicate) => predicate.fields),
+    ),
+    unresolvable_filters: unresolvable,
     ablation: {
       single: ablationSingle,
       pairs: ablationPairs,

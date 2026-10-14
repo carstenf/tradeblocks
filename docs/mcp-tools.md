@@ -137,15 +137,55 @@ See [per-request details](market-data.md#fetch_quotes).
 
 ## Market Analysis
 
-| Tool                         | Description                                                      |
-| ---------------------------- | ---------------------------------------------------------------- |
-| `analyze_regime_performance` | Analyze P&L by market regime (VIX levels, term structure, trend) |
-| `suggest_filters`            | Suggest entry filters based on losing trade analysis             |
-| `calculate_orb`              | Opening range breakout analysis from intraday bars               |
-| `enrich_trades`              | Add market context to trades (lookahead-free temporal joins)     |
-| `find_predictive_fields`     | Identify which market fields predict trade outcomes              |
-| `filter_curve`               | Equity curve with/without a candidate market filter applied      |
-| `get_field_statistics`       | Distribution statistics for any market or trade field            |
+| Tool                         | Description                                                            |
+| ---------------------------- | ---------------------------------------------------------------------- |
+| `analyze_regime_performance` | Analyze P&L by market regime (VIX levels, term structure, trend)       |
+| `suggest_filters`            | Suggest entry filters based on losing trade analysis                   |
+| `calculate_orb`              | Opening range breakout analysis from intraday bars                     |
+| `enrich_trades`              | Add market context to trades (lookahead-free temporal joins)           |
+| `find_predictive_fields`     | Identify which market fields predict trade outcomes                    |
+| `filter_curve`               | Equity curve with/without a candidate market filter applied            |
+| `get_field_statistics`       | Distribution statistics for market, trade or registered dataset fields |
+| `import_daily_dataset`       | Import or replace a Static Dataset CSV with declared timing            |
+| `list_daily_datasets`        | List datasets, fields, timing and coverage                             |
+| `delete_daily_dataset`       | Delete a dataset and unregister its fields                             |
+| `list_analysis_fields`       | Runtime catalog of built-in and dataset analysis fields                |
+
+Static Dataset CSVs use the same parser as the web app: timestamp first, then numeric or
+categorical columns. `import_daily_dataset` takes `name`, exactly one of inline `content` or
+`csvPath` under the data root, optional `ticker`, `columnTiming`, and `knownBy` (HH:mm ET).
+Default timing is close. Date-only close values are available D+1 at 00:00 ET; date-only
+open values require knownBy; timestamped values are as-of. All consumers select the latest
+value available at or before trade entry, including sparse series. There is no freshness
+limit. Values live only in analytics.duckdb's `datasets.dataset` and `datasets.value`, not
+market tables or Parquet. Re-import atomically replaces a named dataset.
+`enrich_trades` retains CSV `customFields` and returns `datasetFields` plus
+`datasetProvenance` (source timestamp and available-at instant) so carry-forward age is visible.
+
+Blank or whitespace-only cells are not observations: imports omit them and causal joins
+carry forward the last real value. They do not change a numeric column into a categorical
+column, and missing numeric values never become zero during filter evaluation.
+When dataset fields participate in aggregate analysis, `datasetAge` reports each field's
+attachment count, median/max source-to-entry age in Eastern calendar days, and
+`olderThan3Days` count. This is visibility only, not a freshness limit. Calls using no
+dataset fields retain their prior output shape.
+
+`find_predictive_fields` ranks registered numeric dataset fields and built-in market fields
+alongside trade fields. `filter_curve` accepts these names directly (for example `signal.score`
+or `RSI_14`); both use the same entry-time values as `enrich_trades`. Dataset fields with no
+available value in the selected trades are refused explicitly.
+`get_field_statistics` also accepts registered dataset columns and built-in market fields,
+using these same causal values and dataset age summaries.
+
+`suggest_filters.fields` optionally selects registered fields: numeric fields sweep percentile
+thresholds; categorical fields test exclusions by value. Omitting fields preserves the existing
+hand-authored defaults. Shared sweeps preserve numeric scale without two-decimal rounding.
+
+`analyze_regime_performance` accepts `field` instead of a preset `segmentBy`. Categorical
+fields group by value. Numeric fields use `bins` as strictly increasing cut points, with
+lower-inclusive/upper-exclusive intervals and unbounded tails; omitted bins use quartiles.
+Existing preset calls retain their behavior. Unknown and entirely uncovered fields are named
+and refused; partial coverage is reported.
 
 ## Strategy Profiles
 
@@ -164,6 +204,28 @@ See [per-request details](market-data.md#fetch_quotes).
 | `validate_entry_filters`   | Test each entry filter's contribution to edge               |
 | `portfolio_structure_map`  | Regime x structure coverage matrix across all strategies    |
 | `suggest_strategy_matches` | Find strategies that match specific market conditions       |
+
+`validate_entry_filters` reports unknown market filter fields in `unresolvable_filters`
+with a reason and excludes them from per-filter results and ablation. Remaining known
+filters are still analyzed; if none are resolvable, it returns `error: "no_resolvable_filters"`
+naming the fields. `analyze_structure_fit` reports the same exclusions while retaining
+its known-field and fixed dimensions. Both tools include the exclusions in their summary
+and warnings. A known field with a missing value on a date is not an unknown field:
+`no_data_count` reports missing observations independently of the covered analysis pool.
+
+Profile coverage is per field, not satisfied by an unrelated dataset value.
+`validate_entry_filters` uses trades covered by every requested filter (including any
+cross-field comparison operand) for its baselines, comparisons and ablations. Dataset-only
+filters work without built-in market rows. Missing-market warnings always count absent
+built-in market rows, even when dataset observations are available.
+Bare close-derived comparison operands use `prev_*` values even when the joined record
+also contains the raw same-day close; missing prior observations are not covered.
+`analyze_structure_fit` groups each dimension only over observations for that dimension
+and returns `dimension_baselines` for those covered pools; update hints compare against
+the corresponding covered baseline. With no dataset dimension involved, `overall` retains
+the existing market-row baseline. When dataset dimensions are used, that overall pool also
+includes trades with observations for the selected dataset dimensions, never unrelated
+dataset fields. Time-of-day uses valid trade times independently of market coverage.
 
 ## Advanced Analysis
 

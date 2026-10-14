@@ -32,12 +32,18 @@ TradeBlocks is an options trading analytics platform with two main components:
 
 ### analytics.duckdb (trades database)
 
-| Table                        | Purpose                                                       |
-| ---------------------------- | ------------------------------------------------------------- |
-| `trades.trade_data`          | Individual trade records synced from CSV                      |
-| `trades.reporting_data`      | Reported/live trades for backtest vs actual comparison        |
-| `trades._sync_metadata`      | Block sync state tracking                                     |
-| `profiles.strategy_profiles` | Strategy profile storage (structure, filters, exits, regimes) |
+| Table                        | Purpose                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| `trades.trade_data`          | Individual trade records synced from CSV                                  |
+| `trades.reporting_data`      | Reported/live trades for backtest vs actual comparison                    |
+| `trades._sync_metadata`      | Block sync state tracking                                                 |
+| `profiles.strategy_profiles` | Strategy profile storage (structure, filters, exits, regimes)             |
+| `datasets.dataset`           | User Static Dataset metadata, ticker, timing, source and import timestamp |
+| `datasets.value`             | Long-format user dataset values with timestamp and date-only precision    |
+
+These on-demand tables are isolated from the market catalog and Parquet store. MCP consumers
+resolve each column through the shared Static Dataset availability implementation in TypeScript;
+the runtime field catalog joins built-in market fields and registered `dataset.column` names.
 
 ### market.duckdb (market database)
 
@@ -65,6 +71,35 @@ Each trading strategy is a "block" — a directory containing CSV files (tradelo
 ### Lookahead-Free Analytics
 
 Close-derived fields (RSI, VIX_Close, Vol_Regime, and ~35 others) are only known after market close. When joining trades with market data, `buildLookaheadFreeQuery()` applies `LAG()` to these fields so analysis uses only information available at the time of trade entry. Open-known fields (Gap_Pct, VIX_Open, Prior_Close) and static fields (Day_of_Week, Month, Is_Opex) are safe to use same-day.
+
+#### Static Dataset timing
+
+New Static Dataset imports declare `close` (default) or `open` for every column.
+For date-only rows, close values become available at midnight ET on the following
+calendar day; a trade on the next session therefore sees the prior available value.
+Open columns require a dataset-level `HH:mm` known-by time in Eastern Time.
+Timestamped rows are as-of their timestamp, including explicitly timestamped midnight.
+The causal nearest-before matcher carries the last available value forward across
+weekends, holidays, and missing rows; it does not enforce freshness.
+
+The shared lib exports `getDatasetValueAvailableAt`, `resolveDatasetColumnAtTime`,
+and `validateDatasetTiming`. The resolver takes immutable dataset metadata and row-array
+snapshots (replace them after edits), refuses unknown columns, and returns the latest
+value available at or before entry. Column-specific availability indexes are cached
+by snapshot identity, so mixed open/close columns may resolve to different source rows.
+
+Existing IndexedDB datasets load as `legacy-same-day` without changing their numbers.
+Static Datasets displays a warning and a **Set column timing** action. Older rows did
+not retain CSV precision: the user must explicitly choose dates-only or per-row
+timestamps when setting timing; mixed-precision legacy files must be re-imported.
+Declared datasets always select the latest value available at entry, regardless of any stored
+match strategy. The web app disables strategy selection for them. Legacy datasets retain
+same-day, nearest-after and nearest exploratory strategies with their lookahead warning.
+
+Daily-log custom fields are a separate, unchanged contract: they still join on the
+trade's calendar date and have no availability declarations. Close-derived values
+in those fields can therefore leak; import them as timed Static Datasets for causal
+analysis instead.
 
 ### Cache-First Bar Loading
 

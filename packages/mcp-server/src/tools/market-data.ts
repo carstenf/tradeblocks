@@ -37,6 +37,8 @@ import {
 import { checkDataAvailability } from "../utils/data-availability.ts";
 import { getProfile } from "../db/profile-schemas.ts";
 import type { MarketStores } from "../market/stores/index.ts";
+import { listDatasets, resolveTradeDatasets } from "../db/dataset-schemas.ts";
+import { suggestFieldFilters, analyzeFieldRegimes } from "./shared/field-analysis.ts";
 
 // =============================================================================
 // Types
@@ -172,7 +174,8 @@ function resultToRecords(result: {
  */
 function getNum(record: Record<string, unknown>, field: string): number {
   const val = record[field];
-  if (val === null || val === undefined) return NaN;
+  if (val === null || val === undefined || (typeof val === "string" && val.trim() === ""))
+    return NaN;
   if (typeof val === "bigint") return Number(val);
   return val as number;
 }
@@ -276,14 +279,28 @@ export function registerMarketDataTools(
         "Returns warnings when market data is partially missing.",
       inputSchema: z.object({
         blockId: z.string().describe("Block ID to analyze"),
+        field: z
+          .string()
+          .optional()
+          .describe(
+            "Registered built-in or dataset field; categorical groups by value, numeric uses bins or quantiles.",
+          ),
+        bins: z
+          .array(z.number().finite())
+          .min(1)
+          .optional()
+          .describe(
+            "Strictly increasing numeric cut points. Intervals are lower-inclusive, upper-exclusive.",
+          ),
         segmentBy: z
           .enum(["volRegime", "termStructure", "dayOfWeek", "gapDirection"])
+          .optional()
           .describe("Market dimension to segment by"),
         strategy: z.string().optional().describe("Filter to specific strategy"),
         ticker: z.string().optional().describe("Underlying ticker symbol (default: SPX)"),
       }),
     },
-    withFullSync(baseDir, async ({ blockId, segmentBy, strategy, ticker }) => {
+    withFullSync(baseDir, async ({ blockId, segmentBy, strategy, ticker, field, bins }) => {
       try {
         const block = await loadBlock(baseDir, blockId);
         let trades = block.trades;
@@ -298,6 +315,9 @@ export function registerMarketDataTools(
             isError: true,
           };
         }
+
+        if (field) return await analyzeFieldRegimes(baseDir, blockId, trades, field, bins);
+        if (!segmentBy) throw new Error("Provide field or segmentBy");
 
         // Collect unique trade keys (ticker+date) and query DuckDB for market data
         const tradeKeys = uniqueTradeLookupKeys(trades);
@@ -519,6 +539,13 @@ export function registerMarketDataTools(
         "Uses market.enriched + market.spot_daily LEFT JOIN VIX tickers + market.enriched_context. Returns warnings when market data is partially missing.",
       inputSchema: z.object({
         blockId: z.string().describe("Block ID to analyze"),
+        fields: z
+          .array(z.string())
+          .min(1)
+          .optional()
+          .describe(
+            "Sweep numeric thresholds or categorical exclusions for these built-in or dataset fields. Omit to keep default suggestions.",
+          ),
         strategy: z.string().optional().describe("Filter to specific strategy"),
         strategyName: z
           .string()
@@ -535,7 +562,7 @@ export function registerMarketDataTools(
     },
     withFullSync(
       baseDir,
-      async ({ blockId, strategy, strategyName, minImprovementPct = 3, ticker }) => {
+      async ({ blockId, strategy, strategyName, minImprovementPct = 3, ticker, fields }) => {
         try {
           const block = await loadBlock(baseDir, blockId);
           let trades = block.trades;
@@ -576,6 +603,9 @@ export function registerMarketDataTools(
               isError: true,
             };
           }
+
+          if (fields)
+            return await suggestFieldFilters(baseDir, blockId, trades, fields, minImprovementPct);
 
           // Collect unique trade keys (ticker+date) and query DuckDB for market data
           const tradeKeys = uniqueTradeLookupKeys(trades);
@@ -1216,6 +1246,7 @@ export function registerMarketDataTools(
 
           // Query DuckDB for lookahead-free market data
           const conn = await getConnection(baseDir);
+          const datasets = await listDatasets(conn);
 
           // Check data availability and collect warnings
           const resolvedTickerET = normalizeTicker(ticker || "") || DEFAULT_MARKET_TICKER;
@@ -1304,6 +1335,7 @@ export function registerMarketDataTools(
 
             const commissions = trade.openingCommissionsFees + trade.closingCommissionsFees;
 
+            const datasetMatch = resolveTradeDatasets(datasets, trade);
             const baseTrade: Record<string, unknown> = {
               dateOpened: lookup.date,
               ticker: lookup.ticker,
@@ -1315,6 +1347,9 @@ export function registerMarketDataTools(
               premium: trade.premium,
               reasonForClose: trade.reasonForClose || null,
               commissions,
+              customFields: trade.customFields ?? {},
+              datasetFields: datasetMatch.values,
+              datasetProvenance: datasetMatch.provenance,
             };
 
             if (!marketData) {
@@ -1399,9 +1434,20 @@ export function registerMarketDataTools(
               "WARNING: outcomeFields contain same-day close-derived values that were NOT available at trade entry time. Do not use these for entry signal analysis.";
           }
 
-          if (availabilityET.warnings.length > 0) {
-            responseData.warnings = availabilityET.warnings;
+          const warnings = [...availabilityET.warnings];
+          for (const { dataset } of datasets) {
+            for (const column of dataset.columns) {
+              const field = `${dataset.name}.${column}`;
+              const missing = enrichedTrades.filter(
+                (trade) => !(field in (trade.datasetFields as Record<string, unknown>)),
+              ).length;
+              if (missing)
+                warnings.push(
+                  `Dataset field '${field}' has no available value for ${missing}/${paginated.length} trades at entry.`,
+                );
+            }
           }
+          if (warnings.length) responseData.warnings = warnings;
 
           const summary = `Enriched trades: ${blockId} | ${matched}/${paginated.length} matched | offset ${offset}, limit ${limit}`;
 
