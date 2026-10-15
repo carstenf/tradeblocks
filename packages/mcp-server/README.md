@@ -581,6 +581,24 @@ Field, objective and mode choices across separate requests are outside the Holm 
 Monthly blocks retain within-month dependence, not cross-month dependence; block
 exchangeability is an assumption. See [the full contract](../../docs/mcp-tools.md#filter-curve-significance-and-stability).
 
+In 4.5.0, `unit: "day"` aggregates entry-date P&L before scoring and month
+permutation; win rate counts profitable days. A field varying within a day is
+refused as `day_field_varies`, with the varying dates. Cheap request/work admission
+precedes causal field resolution and counts the chosen unit conservatively before
+coverage. Omitted `unit` retains trade-mode outputs.
+Day mode also offers `sharpe` (daily dollar P&L, rf=0, sample std, √252),
+`mar` (calendar-day CAGR / drawdown fraction of observed starting capital), and
+`maxDrawdown` (dollar drawdown reduction; smaller is better). Filtered dates are
+flat. Trade units refuse these objectives; MAR additionally refuses missing capital.
+`objectiveMetadata` documents definitions and undefined cases. This dollar-P&L
+Sharpe intentionally differs from the capital-based portfolio return Sharpe.
+`groupBy: "regime.label"` adds chosen-threshold `perGroup` rows in either unit,
+with the same covered baseline/kept/removed shape as `perYear`. Numeric groups use
+`bins` or shared regime-analysis quartiles; categorical groups use values.
+Missing values form an explicit uncovered group, small groups stay flagged,
+and within-day varying groups refuse as `day_group_varies`. Group values honor
+the same causal availability and optional freshness limit.
+
 `suggest_filters` defaults to `objective: "totalPl"`: only positive P&L improvements,
 ranked by P&L improvement with win-rate gain as tie-breaker. `objective: "winRate"`
 admits/ranks by win-rate gain with P&L tie-breaks. `minImprovementPct` (default 3

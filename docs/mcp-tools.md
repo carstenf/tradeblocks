@@ -246,6 +246,93 @@ response. `fields`, `objective`, or `permutation` opts into `bestThreshold` and 
 multi-field results live in `fields`, including named unavailable/uncovered entries.
 Each field has its own covered baseline; dataset timing and `maxMissedSessions` are unchanged.
 
+`unit: "day"` (4.5.0) sums reported P&L by entry calendar date before the
+sweep, yearly rows, and whole-month permutation. Win rate then counts days with
+positive summed P&L (`winRateBasis` in the response), not winning trades.
+Every resolved field value, including missing values, must agree within each day;
+otherwise `day_field_varies` refuses that field and lists the varying `days`.
+Default `unit: "trade"` retains the existing output. Work admission runs before
+field resolution, conservatively counting all selected trades or entry days before
+field coverage; it never silently drops a field to fit the budget.
+Field-named analysis resolves only requested filter/group fields through the same
+availability rule. Unrelated registered datasets cannot inflate the work.
+`get_field_statistics`, field-based `suggest_filters` and `analyze_regime_performance`,
+and profile-based `validate_entry_filters` / `analyze_structure_fit` likewise resolve
+only their named fields (including cross-field comparison operands). Exhaustive
+`find_predictive_fields` still resolves the whole catalog; `enrich_trades` returns
+all fields for its paginated trades (default 50, maximum 500).
+
+With `unit: "day"`, `objective` also accepts `sharpe`, `mar`, and `maxDrawdown`.
+They use the covered entry-date P&L curve, keeping filtered dates flat at zero.
+Only covered entry dates are observations: intervening dates without covered entries
+are not inserted. Sharpe uses √252 annualization; MAR retains calendar-span CAGR
+at 365.25 days per year, not √252.
+They refuse trade units as `objective_requires_day`.
+
+- **Sharpe** is mean daily dollar P&L / sample standard deviation × √252, rf=0;
+  zero variance or fewer than two observations gives 0, matching the shared
+  simulation helper. This intentionally differs from portfolio return Sharpe,
+  which uses historical Treasury rates: a risk-free dollar P&L deduction needs
+  capital, while this measure does not.
+- **MAR** is CAGR / maximum drawdown as a fraction of starting capital. CAGR uses
+  the first through last covered entry dates and 365.25 calendar days per year,
+  measured from calendar parts rather than elapsed local-midnight milliseconds
+  so daylight-saving transitions do not add or subtract an hour from the span,
+  matching the portfolio annualization convention. Capital comes from the existing
+  daily-log/trade-funds resolver, never its assumed default; otherwise
+  `mar_requires_capital` refuses. Zero drawdown, nonpositive ending capital, or no
+  elapsed time yields a null MAR and `mar_undefined`; such candidates are shown
+  but cannot rank, and no eligible MAR candidate gives a named refusal.
+  In `perYear` and `perGroup` rows only, a covered subset spanning fewer than
+  90 calendar days reports `mar: null`, `annualizedReturnPct: null`, and
+  `marUnstable: true` on baseline, kept and removed statistics. The row also
+  sets `marUnstable: true`, and its MAR objective delta is null. A span of exactly
+  90 days is eligible. Whole-population ranking and permutation are unchanged.
+- **maxDrawdown** reports the positive maximum decline of cumulative daily P&L,
+  starting at zero, in dollars and percent of starting capital when observed.
+  Its objective delta is **baseline drawdown minus kept drawdown**: smaller is
+  better. The percent denominator is starting capital, not the rolling peak.
+
+When `strategy` is supplied, portfolio daily logs are never a capital basis.
+Following the performance-chart convention, capital is reconstructed only from
+the strategy-filtered trades' observed funds evidence. Without that evidence,
+MAR refuses as `mar_requires_capital` with
+`capitalReason: "portfolio_capital_not_applicable_to_strategy"`.
+Sharpe and dollar drawdown still work; drawdown percent is null with the same
+`percentReason`, also reported as `objectiveMetadata.capitalReason`.
+Without a strategy filter, daily-log evidence is restricted to the same `startDate`
+and `endDate` window as the trades before resolving capital. The first daily log
+inside that window supplies its starting capital when valid; absent evidence
+falls back to the existing observed trade-funds policy, never a pre-window balance.
+
+Response `objectiveMetadata` states these definitions. Every risk candidate shows
+its objective delta against the covered baseline. Ranking shares the existing
+P&L/win-rate tie-breaks and eligibility (keep and remove at least one observation).
+Every permutation recomputes the baseline path and reruns the complete objective
+sweep. Risk-path work adds `36nt` per sweep to admission, covering path construction
+and risk statistics; Holm and the requested-field family are unchanged.
+
+`groupBy: "regime.label"` (a built-in market or registered dataset field) adds
+`perGroup` rows for the **same chosen threshold**, never independently optimized
+thresholds per group. This opts into `totalPl` selection if no objective was given.
+Rows have the `perYear` shape: covered baseline and its uncovered count/P&L,
+kept/removed counts, P&L, win rate, objective delta and small-sample warning.
+Groups partition every selected trade/day, including filter-uncovered observations.
+Missing group values form a separate row with `group: null`, `groupValue: null`,
+and `uncoveredGroup: true`; a real category named `"uncovered"` remains a string.
+
+Numeric groups use increasing finite `bins` cut points or quartiles over the
+selected unit's group-covered observations, sharing the exact
+`analyze_regime_performance` binning. Intervals are lower-inclusive, upper-exclusive.
+Categorical groups use their values, ordered lexically; numeric groups are ordered
+by bucket, with the uncovered group last. Group values use the same causal resolver
+and `maxMissedSessions` as filter values. Day groups must be constant, including
+missingness, within each entry date: otherwise `day_group_varies` lists the dates
+and group field. Unknown groups refuse as `group_field_unavailable`; bins without
+`groupBy`, unordered cuts, or categorical-incompatible declarations refuse as
+`group_bins_invalid`. Small groups are flagged, never omitted. `groupBy` does not
+add another permutation search or change the Holm family.
+
 `objective` is `totalPl` by default, or `winRate` (percentage-point gain). Best thresholds
 rank P&L delta then win-rate gain, or win-rate gain then P&L delta, using the same ranking
 module as `suggest_filters`. Only candidates keeping and removing at least one covered
@@ -284,9 +371,9 @@ and `permutation_work_limit`. Iterations are capped at **499**. Only when permut
 is requested, `thresholds` and `percentileSteps` are limited to **100** entries each:
 larger arrays produce the named `permutation_candidate_limit` refusal before any sweep.
 Without permutation, these arrays retain their existing unrestricted schema acceptance.
-Permutation admission then estimates work for every requested field using its covered count
-`n`, requested threshold/percentile count `t` (conservative before deduplication), and
-iterations `r`:
+Permutation admission estimates work before resolving fields, using the selected
+trade/day count `n` (an upper bound on covered count), threshold/percentile count `t`
+(conservative before deduplication), and iterations `r`:
 `(r + 2) × (n × ceil(log2(max(2,n))) + 6nt + 3t × ceil(log2(max(2,2t))))`.
 The estimate includes sorting the values and candidates on every sweep, filtering and
 scoring both directions, plus the observed sweeps. Its limits are **30 million work
