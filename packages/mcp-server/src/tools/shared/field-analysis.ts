@@ -4,35 +4,63 @@ import { sweepThresholds } from "../../utils/threshold-sweep.ts";
 import { computeSliceStats } from "../../utils/analysis-stats.ts";
 import { createToolOutput } from "../../utils/output-formatter.ts";
 import { datasetAgeOutput } from "../../db/dataset-schemas.ts";
+import {
+  suggestionEvidence,
+  rankSuggestions,
+  objectiveOutput,
+  type FilterObjective,
+  type SuggestionEvidence,
+} from "./filter-objective.ts";
 
 export async function suggestFieldFilters(
   baseDir: string,
   blockId: string,
   trades: Trade[],
   fields: string[],
-  minImprovementPct: number,
+  minImprovementPct: number | undefined,
+  objective: FilterObjective,
+  maxMissedSessions?: number,
 ) {
-  const { catalog, values, datasetAge } = await resolveAnalysisFields(baseDir, trades);
-  const suggestions: {
+  const { catalog, values, datasetAge } = await resolveAnalysisFields(
+    baseDir,
+    trades,
+    maxMissedSessions,
+  );
+  const suggestions: (SuggestionEvidence & {
     filter: string;
     condition: { field: string; operator: string; value: number | string; lagged: boolean };
-    tradesRemoved: number;
     winnersRemoved: number;
     losersRemoved: number;
     newWinRate: number;
     newTotalPl: number;
     winRateDelta: number;
     plDelta: number;
-    confidence: string;
-  }[] = [];
+  })[] = [];
   const coverage: Record<string, { covered: number; uncovered: number }> = {};
+  const fieldBaselines: Record<
+    string,
+    {
+      count: number;
+      totalPl: number;
+      uncoveredCount: number;
+      uncoveredTotalPl: number;
+    }
+  > = {};
   for (const field of fields) {
-    requireCoveredField(field, catalog, values);
+    requireCoveredField(field, catalog, values, datasetAge);
     const pool = trades
       .map((trade, i) => ({ trade, value: values[i][field] }))
       .filter((item) => item.value !== undefined);
     coverage[field] = { covered: pool.length, uncovered: trades.length - pool.length };
     const baseline = computeSliceStats(pool.map(({ trade }) => trade.pl));
+    fieldBaselines[field] = {
+      count: pool.length,
+      totalPl: baseline.totalPl,
+      uncoveredCount: trades.length - pool.length,
+      uncoveredTotalPl: computeSliceStats(
+        trades.filter((_, i) => values[i][field] === undefined).map((trade) => trade.pl),
+      ).totalPl,
+    };
     const entry = catalog.find((entry) => entry.field === field)!;
     const candidates =
       entry.type === "numeric"
@@ -53,7 +81,15 @@ export async function suggestFieldFilters(
       if (!kept.length || !excluded.size) continue;
       const stats = computeSliceStats(kept.map(({ trade }) => trade.pl));
       const improvement = stats.winRate - baseline.winRate;
-      if (improvement < minImprovementPct) continue;
+      const evidence = suggestionEvidence(
+        objective,
+        improvement,
+        stats.totalPl - baseline.totalPl,
+        kept.length,
+        excluded.size,
+        minImprovementPct ?? 3,
+      );
+      if (!evidence) continue;
       const winnersRemoved = candidate.excluded.filter(({ trade }) => trade.pl > 0).length;
       suggestions.push({
         filter: `Skip when ${field} ${candidate.operator} ${candidate.value}`,
@@ -63,27 +99,29 @@ export async function suggestFieldFilters(
           value: candidate.value,
           lagged: entry.timing === "close",
         },
-        tradesRemoved: excluded.size,
+        ...evidence,
         winnersRemoved,
         losersRemoved: excluded.size - winnersRemoved,
         newWinRate: stats.winRate,
         newTotalPl: stats.totalPl,
         winRateDelta: improvement,
         plDelta: stats.totalPl - baseline.totalPl,
-        confidence: kept.length >= 100 ? "high" : kept.length >= 30 ? "medium" : "low",
       });
     }
   }
-  suggestions.sort((a, b) => b.winRateDelta - a.winRateDelta || b.plDelta - a.plDelta);
+  suggestions.sort((a, b) => rankSuggestions(objective, a, b));
   return createToolOutput(`Field filter analysis: ${blockId} | ${suggestions.length} suggestions`, {
     blockId,
     fields,
+    ...objectiveOutput(objective, minImprovementPct),
     currentStats: computeSliceStats(trades.map((trade) => trade.pl)),
     suggestedFilters: suggestions,
     compositeSuggestions: [],
     coverage,
+    fieldBaselines,
+    comparisonPopulation: "fieldBaselines",
     ...datasetAgeOutput(datasetAge, fields),
-    minImprovementThreshold: minImprovementPct,
+    minImprovementThreshold: objective === "winRate" ? (minImprovementPct ?? 3) : null,
   });
 }
 
@@ -93,9 +131,14 @@ export async function analyzeFieldRegimes(
   trades: Trade[],
   field: string,
   bins?: number[],
+  maxMissedSessions?: number,
 ) {
-  const { catalog, values, datasetAge } = await resolveAnalysisFields(baseDir, trades);
-  requireCoveredField(field, catalog, values);
+  const { catalog, values, datasetAge } = await resolveAnalysisFields(
+    baseDir,
+    trades,
+    maxMissedSessions,
+  );
+  requireCoveredField(field, catalog, values, datasetAge);
   const entry = catalog.find((entry) => entry.field === field)!;
   if (bins && entry.type !== "numeric") throw new Error(`Bins require a numeric field: ${field}`);
   if (bins?.some((value, i) => !Number.isFinite(value) || (i > 0 && value <= bins[i - 1])))

@@ -537,8 +537,39 @@ predictive reports, regime analysis and threshold sweeps. `import_daily_dataset`
 atomically, without changing market data or requiring provider credentials. Date-only close
 values are available the following calendar day at 00:00 ET; date-only open values require
 `knownBy`; timestamped rows are as-of. Sparse columns carry forward their latest available
-observation without a freshness cutoff. See the [dataset tools reference](../../docs/mcp-tools.md#market-analysis)
+observation with no freshness cutoff by default. See the [dataset tools reference](../../docs/mcp-tools.md#market-analysis)
 and [4.1.0 behavior changes](../../releases/v4.1.0.md#behavior-changes).
+
+With Docker's default `-v ./data:/data` mount, put the CSV at
+`./data/datasets/vrp.csv` on the host and pass `csvPath: "datasets/vrp.csv"` or
+`"/data/datasets/vrp.csv"`; use the container path beneath the configured data root.
+Close-column metadata shows `knownBy: null`; open columns retain the configured value.
+Field-based `suggest_filters` retains all-trade `currentStats` and reports per-field
+`fieldBaselines` (`count`, `totalPl`, `uncoveredCount`, `uncoveredTotalPl`).
+Suggestions compare against those covered populations; `filter_curve.baseline`
+reports the same covered and uncovered counts and P&L.
+
+`suggest_filters` defaults to `objective: "totalPl"`: only positive P&L improvements,
+ranked by P&L improvement with win-rate gain as tie-breaker. `objective: "winRate"`
+admits/ranks by win-rate gain with P&L tie-breaks. `minImprovementPct` (default 3
+percentage points) applies only to `winRate`; it is ignored under `totalPl` and the
+response notes this when supplied. Standalone and composite suggestions include
+`tradesKept`, `keptFraction`, `tradesRemoved`, and `objective`. `confidence` means
+sample-size support, not statistical confidence; keeping less than 20% caps it at
+low and adds a low-retention warning. Composite metrics describe kept trades.
+
+Dataset consumers accept optional `maxMissedSessions` (a nonnegative integer).
+`datasetAge` preserves calendar-day ages and adds missed expected XNYS session ages:
+close columns expect the prior session; open columns expect today's session only
+at/after known-by ET (timestamped open rows without known-by use midnight for this
+daily-session diagnostic, not for as-of matching). Friday close → Monday is 0 missed;
+a missing Friday is 1, and holidays do not count. The calendar covers 2022–2030;
+outside it, age is explicitly `unsupported`. With a limit set, stale/unsupported
+values are refused and count as uncovered in field baselines. Without it, matching
+is unchanged. `datasetWarnings` names stale/unsupported/refused counts;
+`enrich_trades` includes session age in provenance and names `datasetRejections`.
+Session summaries include refused candidates; calendar-day summaries count accepted
+attachments only, returning null ages when none were accepted.
 
 ### Strategy Profile Tools
 

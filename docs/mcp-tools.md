@@ -154,21 +154,50 @@ See [per-request details](market-data.md#fetch_quotes).
 Static Dataset CSVs use the same parser as the web app: timestamp first, then numeric or
 categorical columns. `import_daily_dataset` takes `name`, exactly one of inline `content` or
 `csvPath` under the data root, optional `ticker`, `columnTiming`, and `knownBy` (HH:mm ET).
+For Docker's default `-v ./data:/data` mount, put the CSV at `./data/datasets/vrp.csv`
+on the host and pass `csvPath: "datasets/vrp.csv"` or `"/data/datasets/vrp.csv"`.
+Use the container path beneath the configured data root, not the host path.
 Default timing is close. Date-only close values are available D+1 at 00:00 ET; date-only
 open values require knownBy; timestamped values are as-of. All consumers select the latest
-value available at or before trade entry, including sparse series. There is no freshness
-limit. Values live only in analytics.duckdb's `datasets.dataset` and `datasets.value`, not
+value available at or before trade entry, including sparse series. By default there is no
+freshness limit. Values live only in analytics.duckdb's `datasets.dataset` and `datasets.value`, not
 market tables or Parquet. Re-import atomically replaces a named dataset.
+Field metadata reports `knownBy: null` for close columns; the dataset's stored known-by
+continues to apply only to date-only open observations.
 `enrich_trades` retains CSV `customFields` and returns `datasetFields` plus
 `datasetProvenance` (source timestamp and available-at instant) so carry-forward age is visible.
 
 Blank or whitespace-only cells are not observations: imports omit them and causal joins
 carry forward the last real value. They do not change a numeric column into a categorical
 column, and missing numeric values never become zero during filter evaluation.
-When dataset fields participate in aggregate analysis, `datasetAge` reports each field's
-attachment count, median/max source-to-entry age in Eastern calendar days, and
-`olderThan3Days` count. This is visibility only, not a freshness limit. Calls using no
-dataset fields retain their prior output shape.
+When dataset fields participate in analysis, `datasetAge` keeps each field's attachment count,
+median/max source-to-entry age in Eastern calendar days, and `olderThan3Days` count.
+It also reports `sessionAgeStatus`, `medianAgeSessions`, `maxAgeSessions`,
+`staleAttachments` (candidate attachments missing at least one expected session),
+`unsupportedSessionAge` and `rejectedAttachments`. Session statistics include rejected
+candidates; calendar-day statistics and `attachments` describe accepted values only
+(ages are null if none were accepted). `datasetWarnings` names stale, unsupported and
+refused fields and counts. Calls using no dataset fields retain their prior output shape.
+
+Session age counts **missed expected XNYS sessions**, not distance between dates.
+For close columns the expected source is the prior session: Friday close → Monday entry
+is 0; a missing Friday is 1. Holidays do not count. For open columns, today's session is
+expected only at/after known-by ET; before then the prior session is expected.
+Timestamped observations remain as-of; open-column freshness uses the declared known-by
+or midnight ET if omitted. This daily-session diagnostic does not infer intraday cadence.
+The shared library's existing XNYS calendar covers 2022–2030 only; outside that range
+session age is explicitly `unsupported` (null aggregate ages), never guessed from weekdays.
+
+`maxMissedSessions` is an optional nonnegative integer on `enrich_trades`,
+`suggest_filters`, `analyze_regime_performance`, `filter_curve`, `find_predictive_fields`,
+`get_field_statistics`, `analyze_structure_fit`, and `validate_entry_filters`.
+It refuses a dataset attachment when missed sessions exceed the limit, or when session
+age is unsupported. Rejected trades count as uncovered for that field, including its
+baseline count/P&L; `enrich_trades.datasetRejections` names refused fields and provenance.
+Omitting the limit preserves matching exactly. Built-in market fields are unaffected.
+Datasets with undeclared (legacy) timing report session age `unsupported`, so any
+`maxMissedSessions` limit refuses them. In practice these are legacy web datasets;
+MCP imports always declare timing.
 
 `find_predictive_fields` ranks registered numeric dataset fields and built-in market fields
 alongside trade fields. `filter_curve` accepts these names directly (for example `signal.score`
@@ -180,6 +209,22 @@ using these same causal values and dataset age summaries.
 `suggest_filters.fields` optionally selects registered fields: numeric fields sweep percentile
 thresholds; categorical fields test exclusions by value. Omitting fields preserves the existing
 hand-authored defaults. Shared sweeps preserve numeric scale without two-decimal rounding.
+The fields path keeps all-trade `currentStats` and reports `fieldBaselines` by field:
+covered `count`/`totalPl` and `uncoveredCount`/`uncoveredTotalPl`.
+`comparisonPopulation: "fieldBaselines"` identifies what suggestions compare against.
+`filter_curve.baseline` reports the same covered and uncovered counts and P&L.
+
+`suggest_filters.objective` defaults to `totalPl`: admit only positive P&L improvements
+and rank by P&L improvement (win-rate gain breaks ties). Use `winRate` to admit and rank
+by win-rate gain, with P&L as the tie-breaker. `minImprovementPct` is a percentage-point
+win-rate threshold only under `winRate` (default 3); it is ignored under `totalPl`.
+The response names `objective`, `rankingRule`, and notes the ignored argument when supplied.
+Each standalone/composite suggestion reports `tradesKept`, `keptFraction`, `tradesRemoved`,
+and `objective`. The retained `confidence` key means sample-size support, not statistical
+confidence: high requires at least 20 kept/10 removed, medium 10 kept/5 removed, otherwise low.
+Keeping less than 20% of the covered pool always caps support at low and adds a
+`Low retention` warning. Composite projections describe the retained complement of the
+AND exclusion and use the same objective, not a separate standalone-relative gain gate.
 
 `analyze_regime_performance` accepts `field` instead of a preset `segmentBy`. Categorical
 fields group by value. Numeric fields use `bins` as strictly increasing cut points, with

@@ -120,6 +120,17 @@ test("profile filters use close carry-forward and open known-by rather than same
     knownBy: "09:30",
   });
   expect(imported.isError ? imported.content : null).toBeNull();
+  const expectedFields = expect.arrayContaining([
+    expect.objectContaining({ field: "signal.score", knownBy: null }),
+    expect.objectContaining({ field: "signal.open", knownBy: "09:30" }),
+  ]);
+  expect(imported.structuredContent?.fields).toEqual(expectedFields);
+  expect((await handlers.list_daily_datasets({})).structuredContent?.datasets).toEqual(
+    expect.arrayContaining([expect.objectContaining({ fields: expectedFields })]),
+  );
+  expect((await handlers.list_analysis_fields({})).structuredContent?.fields).toEqual(
+    expectedFields,
+  );
   await mkdir(path.join(baseDir, "sample"));
   await writeFile(
     path.join(baseDir, "sample", "tradelog.csv"),
@@ -192,6 +203,7 @@ test("profile filters use close carry-forward and open known-by rather than same
         "signal.score": {
           sourceTimestamp: "2025-01-02T05:00:00.000Z",
           availableAt: "2025-01-03T05:00:00.000Z",
+          sessionAge: 0,
         },
       }),
     }),
@@ -499,7 +511,18 @@ test("blank cells remain numeric, carry forward, and expose aggregate source age
   for (const output of outputs) {
     expect(output.isError ? output.content : null).toBeNull();
     expect(output.structuredContent?.datasetAge).toEqual({
-      "blank.x": { attachments: 10, medianAgeDays: 3, maxAgeDays: 4, olderThan3Days: 5 },
+      "blank.x": {
+        attachments: 10,
+        medianAgeDays: 3,
+        maxAgeDays: 4,
+        olderThan3Days: 5,
+        sessionAgeStatus: "supported",
+        medianAgeSessions: 1.5,
+        maxAgeSessions: 2,
+        staleAttachments: 10,
+        unsupportedSessionAge: 0,
+        rejectedAttachments: 0,
+      },
     });
   }
   const preset = await handlers.analyze_regime_performance({
@@ -598,7 +621,18 @@ test("unrelated dataset values do not inflate built-in profile baselines or hide
     expect.objectContaining({ tradeCount: 1, totalPl: 100 }),
   );
   expect(mixedValidation.structuredContent?.datasetAge).toEqual({
-    "extra.x": { attachments: 1, medianAgeDays: 1, maxAgeDays: 1, olderThan3Days: 0 },
+    "extra.x": {
+      attachments: 1,
+      medianAgeDays: 1,
+      maxAgeDays: 1,
+      olderThan3Days: 0,
+      sessionAgeStatus: "supported",
+      medianAgeSessions: 0,
+      maxAgeSessions: 0,
+      staleAttachments: 0,
+      unsupportedSessionAge: 0,
+      rejectedAttachments: 0,
+    },
   });
   const mixedFit = await handleAnalyzeStructureFit(input, baseDir);
   expect(mixedFit.structuredContent?.dimension_baselines).toEqual(
@@ -624,7 +658,18 @@ test("unrelated dataset values do not inflate built-in profile baselines or hide
     expect.objectContaining({ tradeCount: 1, totalPl: 100 }),
   );
   expect(operandValidation.structuredContent?.datasetAge).toEqual({
-    "extra.x": { attachments: 1, medianAgeDays: 1, maxAgeDays: 1, olderThan3Days: 0 },
+    "extra.x": {
+      attachments: 1,
+      medianAgeDays: 1,
+      maxAgeDays: 1,
+      olderThan3Days: 0,
+      sessionAgeStatus: "supported",
+      medianAgeSessions: 0,
+      maxAgeSessions: 0,
+      staleAttachments: 0,
+      unsupportedSessionAge: 0,
+      rejectedAttachments: 0,
+    },
   });
 });
 
@@ -663,4 +708,296 @@ test("dataset-only profile filters include covered trades without market rows", 
       day_of_week: expect.objectContaining({ tradeCount: 0 }),
     }),
   );
+});
+
+test("field suggestions and curves name the same covered baseline and uncovered loss", async () => {
+  await handlers.import_daily_dataset({
+    name: "signal",
+    content: "date,score\n2025-01-02,1\n2025-01-03,9",
+  });
+  await mkdir(path.join(baseDir, "baseline"));
+  await writeFile(
+    path.join(baseDir, "baseline", "tradelog.csv"),
+    [
+      "Date Opened,Time Opened,Opening Price,Legs,Premium,Closing Price,Date Closed,Time Closed,Avg. Closing Cost,Reason For Close,P/L,No. of Contracts,Funds at Close,Margin Req.,Strategy,Opening Commissions + Fees,Closing Commissions + Fees",
+      ...[
+        ["2025-01-02", -1147],
+        ["2025-01-03", 7000],
+        ["2025-01-06", -291],
+      ].map(
+        ([date, pl]) =>
+          `${date},10:00:00,1,SPX Put Spread,1,0,${date},15:00:00,0,Profit Target,${pl},1,10000,500,Test,0,0`,
+      ),
+    ].join("\n"),
+  );
+  const server = {
+    registerTool(name: string, _config: unknown, handler: (typeof handlers)[string]) {
+      handlers[name] = handler;
+    },
+  } as unknown as McpServer;
+  registerPredictiveTools(server, baseDir);
+  registerMarketDataTools(
+    server,
+    baseDir,
+    createMarketStores({
+      get conn() {
+        return getCurrentConnection();
+      },
+      dataDir: baseDir,
+      parquetMode: false,
+      tickers: new TickerRegistry([{ underlying: "SPX", roots: ["SPX", "SPXW"] }]),
+    }),
+  );
+  const suggestions = await handlers.suggest_filters({
+    blockId: "baseline",
+    fields: ["signal.score"],
+    minImprovementPct: 1,
+  });
+  const curve = await handlers.filter_curve({
+    blockId: "baseline",
+    field: "signal.score",
+    mode: "both",
+    thresholds: [5],
+    percentileSteps: [50],
+  });
+  const baseline = { count: 2, totalPl: 6709, uncoveredCount: 1, uncoveredTotalPl: -1147 };
+  expect(suggestions.structuredContent?.currentStats).toEqual(
+    expect.objectContaining({ tradeCount: 3, totalPl: 5562 }),
+  );
+  expect(suggestions.structuredContent?.fieldBaselines).toEqual({
+    "signal.score": expect.objectContaining(baseline),
+  });
+  expect(suggestions.structuredContent?.comparisonPopulation).toBe("fieldBaselines");
+  expect(curve.structuredContent?.baseline).toEqual(expect.objectContaining(baseline));
+});
+
+test("both suggestion paths honor the objective and cap support for 95 percent removal", async () => {
+  await handlers.import_daily_dataset({
+    name: "objective",
+    content: "date,state\n2025-01-02,keep\n2025-01-03,skip",
+    columnTiming: { state: "open" },
+    knownBy: "09:30",
+  });
+  await mkdir(path.join(baseDir, "objective"));
+  await writeFile(
+    path.join(baseDir, "objective", "tradelog.csv"),
+    [
+      "Date Opened,Time Opened,Opening Price,Legs,Premium,Closing Price,Date Closed,Time Closed,Avg. Closing Cost,Reason For Close,P/L,No. of Contracts,Funds at Close,Margin Req.,Strategy,Opening Commissions + Fees,Closing Commissions + Fees",
+      ...Array.from({ length: 200 }, (_, i) => {
+        const date = i < 10 ? "2025-01-02" : "2025-01-03";
+        const pl = i < 10 ? 1 : i < 110 ? 100 : -1;
+        return `${date},10:00:00,1,SPX Put Spread,1,0,${date},15:00:00,0,Profit Target,${pl},1,10000,500,Test,0,0`;
+      }),
+    ].join("\n"),
+  );
+  const conn = await upgradeToReadWrite(baseDir);
+  await conn.run(
+    "INSERT INTO market.enriched (ticker, date, Gap_Pct) VALUES ('SPX', '2025-01-02', 0), ('SPX', '2025-01-03', 2)",
+  );
+  const server = {
+    registerTool(name: string, _config: unknown, handler: (typeof handlers)[string]) {
+      handlers[name] = handler;
+    },
+  } as unknown as McpServer;
+  registerMarketDataTools(
+    server,
+    baseDir,
+    createMarketStores({
+      get conn() {
+        return getCurrentConnection();
+      },
+      dataDir: baseDir,
+      parquetMode: false,
+      tickers: new TickerRegistry([{ underlying: "SPX", roots: ["SPX", "SPXW"] }]),
+    }),
+  );
+  for (const fields of [undefined, ["objective.state"]]) {
+    for (const objective of [undefined, "totalPl", "winRate"]) {
+      const output = await handlers.suggest_filters({
+        blockId: "objective",
+        fields,
+        objective,
+        minImprovementPct: 3,
+      });
+      expect(output.isError ? output.content : null).toBeNull();
+      expect(output.structuredContent?.objective).toBe(objective ?? "totalPl");
+      const suggestions = output.structuredContent?.suggestedFilters as {
+        condition: { field: string; value: unknown };
+        plDelta: number;
+      }[];
+      const candidate = suggestions.find((item) =>
+        fields ? item.condition.value === "skip" : item.condition.field === "Gap_Pct",
+      );
+      if (objective === "winRate") {
+        expect(candidate).toEqual(
+          expect.objectContaining({
+            objective: "winRate",
+            tradesKept: 10,
+            keptFraction: 0.05,
+            tradesRemoved: 190,
+            plDelta: -9910,
+            confidence: "low",
+            warnings: expect.arrayContaining([expect.stringContaining("Low retention")]),
+          }),
+        );
+        if (!fields) {
+          expect(output.structuredContent?.compositeSuggestions).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                projectedWinRate: 100,
+                projectedAvgPl: 1,
+                plDelta: -9910,
+                winRateDelta: 45,
+                improvement: 0,
+                tradesKept: 10,
+                tradesRemoved: 190,
+                keptFraction: 0.05,
+                confidence: "low",
+                objective: "winRate",
+              }),
+            ]),
+          );
+        }
+      } else {
+        expect(candidate).toBeUndefined();
+        expect(suggestions.every((item) => item.plDelta > 0)).toBe(true);
+        expect(output.structuredContent?.objectiveNote).toContain("minImprovementPct is ignored");
+      }
+    }
+  }
+});
+
+test("session freshness uses resolver provenance and rejected trades become uncovered baselines", async () => {
+  await handlers.import_daily_dataset({
+    name: "fresh",
+    content: "date,x\n2025-01-03,1\n2025-01-06,9",
+  });
+  await mkdir(path.join(baseDir, "fresh"));
+  await writeFile(
+    path.join(baseDir, "fresh", "tradelog.csv"),
+    [
+      "Date Opened,Time Opened,Opening Price,Legs,Premium,Closing Price,Date Closed,Time Closed,Avg. Closing Cost,Reason For Close,P/L,No. of Contracts,Funds at Close,Margin Req.,Strategy,Opening Commissions + Fees,Closing Commissions + Fees",
+      ...[
+        ["2025-01-06", 100],
+        ["2025-01-08", -50],
+      ].map(
+        ([date, pl]) =>
+          `${date},10:00:00,1,SPX Put Spread,1,0,${date},15:00:00,0,Profit Target,${pl},1,10000,500,Test,0,0`,
+      ),
+    ].join("\n"),
+  );
+  const server = {
+    registerTool(name: string, _config: unknown, handler: (typeof handlers)[string]) {
+      handlers[name] = handler;
+    },
+  } as unknown as McpServer;
+  registerPredictiveTools(server, baseDir);
+  registerFieldTools(server, baseDir);
+  registerMarketDataTools(
+    server,
+    baseDir,
+    createMarketStores({
+      get conn() {
+        return getCurrentConnection();
+      },
+      dataDir: baseDir,
+      parquetMode: false,
+      tickers: new TickerRegistry([{ underlying: "SPX", roots: ["SPX", "SPXW"] }]),
+    }),
+  );
+  for (const maxMissedSessions of [undefined, 0]) {
+    const output = await handlers.suggest_filters({
+      blockId: "fresh",
+      fields: ["fresh.x"],
+      minImprovementPct: 1,
+      maxMissedSessions,
+    });
+    const curve = await handlers.filter_curve({
+      blockId: "fresh",
+      field: "fresh.x",
+      mode: "both",
+      thresholds: [5],
+      percentileSteps: [50],
+      maxMissedSessions,
+    });
+    const expected =
+      maxMissedSessions === undefined
+        ? { count: 2, totalPl: 50, uncoveredCount: 0, uncoveredTotalPl: 0 }
+        : { count: 1, totalPl: 100, uncoveredCount: 1, uncoveredTotalPl: -50 };
+    expect(output.structuredContent?.fieldBaselines).toEqual({ "fresh.x": expected });
+    expect(curve.structuredContent?.baseline).toEqual(expect.objectContaining(expected));
+    expect(output.structuredContent?.datasetAge).toEqual({
+      "fresh.x": expect.objectContaining({
+        medianAgeSessions: 0.5,
+        maxAgeSessions: 1,
+        staleAttachments: 1,
+        rejectedAttachments: maxMissedSessions === undefined ? 0 : 1,
+      }),
+    });
+    expect(output.structuredContent?.datasetWarnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("1 candidate attachments missed")]),
+    );
+  }
+  for (const [source, entry, timing, time, age] of [
+    ["2025-01-03", "2025-01-06", "close", "10:00:00", 0],
+    ["2025-01-02", "2025-01-06", "close", "10:00:00", 1],
+    ["2026-07-02", "2026-07-06", "close", "10:00:00", 0],
+    ["2030-12-31", "2031-01-02", "close", "10:00:00", "unsupported"],
+    ["2025-01-03", "2025-01-06", "open", "09:29:00", 0],
+    ["2025-01-03", "2025-01-06", "open", "09:30:00", 1],
+  ] as const) {
+    await handlers.import_daily_dataset({
+      name: "fresh",
+      content: `date,x\n${source},1`,
+      columnTiming: { x: timing },
+      knownBy: "09:30",
+    });
+    // A separate block name per case avoids the CSV loader's cached snapshot.
+    const blockId = `case-${source}-${timing}-${time.replaceAll(":", "")}`;
+    await mkdir(path.join(baseDir, blockId));
+    await writeFile(
+      path.join(baseDir, blockId, "tradelog.csv"),
+      [
+        "Date Opened,Time Opened,Opening Price,Legs,Premium,Closing Price,Date Closed,Time Closed,Avg. Closing Cost,Reason For Close,P/L,No. of Contracts,Funds at Close,Margin Req.,Strategy,Opening Commissions + Fees,Closing Commissions + Fees",
+        `${entry},${time},1,SPX Put Spread,1,0,${entry},15:00:00,0,Profit Target,100,1,10000,500,Test,0,0`,
+      ].join("\n"),
+    );
+    const enriched = await handlers.enrich_trades({
+      blockId,
+      limit: 50,
+      offset: 0,
+      includeOutcomeFields: false,
+      includeIntradayContext: false,
+    });
+    expect(enriched.isError ? enriched.content : null).toBeNull();
+    expect(enriched.structuredContent?.trades).toEqual([
+      expect.objectContaining({
+        datasetFields: { "fresh.x": 1 },
+        datasetProvenance: { "fresh.x": expect.objectContaining({ sessionAge: age }) },
+      }),
+    ]);
+    expect(enriched.structuredContent?.datasetAge).toEqual({
+      "fresh.x": expect.objectContaining({
+        sessionAgeStatus: age === "unsupported" ? "unsupported" : "supported",
+        maxAgeSessions: age === "unsupported" ? null : age,
+        unsupportedSessionAge: age === "unsupported" ? 1 : 0,
+      }),
+    });
+    if (age === "unsupported") {
+      const limited = await handlers.enrich_trades({
+        blockId,
+        maxMissedSessions: 0,
+        limit: 50,
+        offset: 0,
+        includeOutcomeFields: false,
+        includeIntradayContext: false,
+      });
+      expect(limited.structuredContent?.trades).toEqual([
+        expect.objectContaining({
+          datasetFields: {},
+          datasetRejections: { "fresh.x": expect.objectContaining({ sessionAge: "unsupported" }) },
+        }),
+      ]);
+    }
+  }
 });
