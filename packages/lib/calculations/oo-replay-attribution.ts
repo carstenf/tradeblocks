@@ -51,6 +51,9 @@ export interface ReplayStrategyCost {
   opening_fee_per_leg_contract: number;
   exit_slippage: number;
   exit_slippage_source: "exitSlippage" | "entrySlippage_legacy";
+  /** Per-share package entry debit omitted from leg pricePerContract; null explicitly means zero. */
+  entry_slippage?: number | null;
+  entry_slippage_source?: "entrySlippage";
   settings_sha256: string;
   settings_run_id: string;
   backtest_id: string;
@@ -149,6 +152,18 @@ export interface OoReplayAttribution {
     schema_id: "tradeblocks.oo-replay-quote-observations/v1";
     observations: ReplayQuoteObservation[];
   };
+}
+
+export interface ReplayMethodV3Parameters extends ReplayMethodV2Parameters {
+  open_mark_slippage_basis: "entry_slippage";
+}
+
+export interface OoReplayAttributionV3 extends Omit<
+  OoReplayAttribution,
+  "method_id" | "method_parameters"
+> {
+  method_id: "oo-replay-method/v3";
+  method_parameters: ReplayMethodV3Parameters;
 }
 
 /** SPXW is the observed OO-preferred PM-settled series, including on third Fridays. */
@@ -277,11 +292,25 @@ export function cumulativeReplayTradeMark(
   date: string,
   quoteLookup: ReplayQuoteLookup,
   cost: ReplayStrategyCost,
-  parameters: ReplayMethodOverrides = {},
+  parameters: ReplayMethodOverrides & {
+    method_id?: "oo-replay-method/v2" | "oo-replay-method/v3";
+  } = {},
   markTime?: string,
 ): ReplayMark {
+  if (
+    parameters.method_id !== undefined &&
+    parameters.method_id !== "oo-replay-method/v2" &&
+    parameters.method_id !== "oo-replay-method/v3"
+  ) {
+    throw new RangeError("Invalid replay method parameters");
+  }
   const contracts = packageContractCount(trade);
-  if (!cost || contracts === undefined) {
+  const v3 = parameters.method_id === "oo-replay-method/v3";
+  if (
+    !cost ||
+    contracts === undefined ||
+    (v3 && (cost.entry_slippage === undefined || cost.entry_slippage_source !== "entrySlippage"))
+  ) {
     return { value: null, reason: "missing_strategy_cost", missing_tickers: [], observations: [] };
   }
   const method = { ...DEFAULT_REPLAY_METHOD_PARAMETERS, ...parameters };
@@ -307,21 +336,47 @@ export function cumulativeReplayTradeMark(
       marked.value -
       entry -
       cost.opening_fee_per_leg_contract * legContracts -
-      cost.exit_slippage * 100 * contracts,
+      (v3 ? (cost.entry_slippage ?? 0) : cost.exit_slippage) * 100 * contracts,
   };
 }
 
-export function calculateOoReplayAttribution({
-  trades,
-  curve,
-  quoteLookup,
-  parameters = {},
-}: {
+type ReplayAttributionInput = {
   trades: readonly ReplayTrade[];
   curve: readonly { date: string; netLiquidity: number }[];
   quoteLookup: ReplayQuoteLookup;
   parameters?: ReplayMethodOverrides;
-}): OoReplayAttribution {
+};
+
+export function calculateOoReplayAttribution(input: ReplayAttributionInput): OoReplayAttribution {
+  if (
+    input.parameters &&
+    "method_id" in input.parameters &&
+    input.parameters.method_id !== undefined &&
+    input.parameters.method_id !== "oo-replay-method/v2"
+  ) {
+    throw new RangeError("Invalid replay method parameters");
+  }
+  return calculateReplayAttribution(input, "oo-replay-method/v2");
+}
+
+export function calculateOoReplayAttributionV3(
+  input: ReplayAttributionInput,
+): OoReplayAttributionV3 {
+  const result = calculateReplayAttribution(input, "oo-replay-method/v3");
+  return {
+    ...result,
+    method_id: "oo-replay-method/v3",
+    method_parameters: {
+      ...result.method_parameters,
+      open_mark_slippage_basis: "entry_slippage",
+    },
+  };
+}
+
+function calculateReplayAttribution(
+  { trades, curve, quoteLookup, parameters = {} }: ReplayAttributionInput,
+  method_id: "oo-replay-method/v2" | "oo-replay-method/v3",
+): OoReplayAttribution {
   const method = {
     ...DEFAULT_REPLAY_METHOD_PARAMETERS,
     ...parameters,
@@ -330,6 +385,7 @@ export function calculateOoReplayAttribution({
       ...parameters.root_precedence,
     },
   };
+  const markParameters = { ...method, method_id };
   if (!Number.isFinite(method.tolerance_fraction) || method.tolerance_fraction < 0) {
     throw new RangeError("Invalid replay method parameters");
   }
@@ -364,7 +420,7 @@ export function calculateOoReplayAttribution({
         date,
         memoLookup,
         cost,
-        method,
+        markParameters,
         markTime(date),
       );
       markCache.set(key, result);
@@ -416,7 +472,12 @@ export function calculateOoReplayAttribution({
       const trade = trades[index];
       if (trade.dateClosed < current.date || trade.dateOpened > current.date) continue;
       const cost = method.cost_schedule?.[trade.strategyId];
-      if (!cost || contractCounts[index] === undefined) {
+      if (
+        !cost ||
+        contractCounts[index] === undefined ||
+        (method_id === "oo-replay-method/v3" &&
+          (cost.entry_slippage === undefined || cost.entry_slippage_source !== "entrySlippage"))
+      ) {
         missingCosts.add(trade.strategyName.split("·")[0].trim());
         continue;
       }
@@ -567,14 +628,27 @@ export function calculateOoReplayAttribution({
   for (const row of daily)
     if (row.reason)
       unavailable_reasons[row.reason.code] = (unavailable_reasons[row.reason.code] ?? 0) + 1;
-  return {
+  const result: OoReplayAttribution = {
     method_id: "oo-replay-method/v2",
     method_parameters: {
       ...method,
       mark_time: "session_close_minus_1m",
       mark_rule: "equity_close_minus_1m",
       mid_rounding: "half_up_0.05",
-      cost_schedule: method.cost_schedule ?? {},
+      cost_schedule:
+        method_id === "oo-replay-method/v3"
+          ? (method.cost_schedule ?? {})
+          : Object.fromEntries(
+              Object.entries(method.cost_schedule ?? {}).map(([id, cost]) => {
+                if (!("entry_slippage" in cost) && !("entry_slippage_source" in cost)) {
+                  return [id, cost];
+                }
+                const { entry_slippage, entry_slippage_source, ...legacy } = cost;
+                void entry_slippage;
+                void entry_slippage_source;
+                return [id, legacy];
+              }),
+            ),
       calendar_revision: XNYS_SESSION_CALENDAR_REVISION,
     },
     stats: {
@@ -592,4 +666,5 @@ export function calculateOoReplayAttribution({
       ),
     },
   };
+  return result;
 }
