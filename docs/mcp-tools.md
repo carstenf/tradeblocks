@@ -203,6 +203,21 @@ MCP imports always declare timing.
 alongside trade fields. `filter_curve` accepts these names directly (for example `signal.score`
 or `RSI_14`); both use the same entry-time values as `enrich_trades`. Dataset fields with no
 available value in the selected trades are refused explicitly.
+
+`find_predictive_fields.method` accepts `pearson` (default), `spearman`, or `kendall`
+(tie-adjusted Kendall tau-b). Ranking uses the selected coefficient. Explicit requests
+report `method`; omission preserves the existing Pearson response shape. All methods
+use the same covered entry-time pairs and honor `maxMissedSessions`.
+Kendall is quadratic: the shared ranking module admits at most **75 million total
+estimated pair comparisons**, summed as `n_f × (n_f - 1) / 2` across fields with at
+least `minSamples` valid field/target pairs. Here `n_f` follows each field's causal
+coverage after strategy/date filtering; constant fields are conservatively included
+before variance screening. Admission precedes every quadratic correlation calculation.
+Refusals report `status: "refused"`, `reason: "kendall_pair_work_limit"`,
+`estimatedPairs`, `pairLimit`, covered `fieldCount`, and prefiltered `tradeCount`.
+A 1,100-trade block with 100 fully covered fields needs 60,445,000 pairs and passes;
+124 fully covered fields fit, while 125 exceed the cap. A 20,000-trade field alone
+needs 199,990,000 pairs and is refused. Pearson and Spearman are unchanged.
 `get_field_statistics` also accepts registered dataset columns and built-in market fields,
 using these same causal values and dataset age summaries.
 
@@ -213,6 +228,74 @@ The fields path keeps all-trade `currentStats` and reports `fieldBaselines` by f
 covered `count`/`totalPl` and `uncoveredCount`/`uncoveredTotalPl`.
 `comparisonPopulation: "fieldBaselines"` identifies what suggestions compare against.
 `filter_curve.baseline` reports the same covered and uncovered counts and P&L.
+
+#### Filter-curve significance and stability
+
+Use either `field: "signal.score"` or `fields: ["signal.score", "other.score"]`
+(up to 10 distinct fields). Single-field calls without new options retain the existing
+response. `fields`, `objective`, or `permutation` opts into `bestThreshold` and `perYear`;
+multi-field results live in `fields`, including named unavailable/uncovered entries.
+Each field has its own covered baseline; dataset timing and `maxMissedSessions` are unchanged.
+
+`objective` is `totalPl` by default, or `winRate` (percentage-point gain). Best thresholds
+rank P&L delta then win-rate gain, or win-rate gain then P&L delta, using the same ranking
+module as `suggest_filters`. Only candidates keeping and removing at least one covered
+trade are eligible. Unlike suggestions, the curve reports the best even if its delta
+is negative: a fitted optimum is not a recommendation. Legacy `sweetSpots` remain
+unchanged. Per-year rows partition entries by calendar year, including uncovered-only
+years, and show covered baseline, kept/removed count, P&L and win rate, objective delta,
+and uncovered counts/P&L. Fewer than 30 baseline, kept or removed entries is flagged,
+not dropped. Values equal to the threshold are removed because comparisons are strict.
+
+```json
+{
+  "blockId": "sample",
+  "fields": ["custom.signal", "custom.noise"],
+  "objective": "totalPl",
+  "permutation": { "iterations": 499, "block": "month", "seed": 42 }
+}
+```
+
+Permutation is opt-in and selection-adjusted: every draw reruns **all** requested
+thresholds/directions and compares the best objective delta with the observed best.
+Covered trades are stably ordered by entry date, then outcomes are grouped into
+calendar-month blocks. Fisher–Yates shuffles whole blocks, preserving their internal
+outcome order (and ties); the flattened outcomes are paired with the fixed field
+series. This is simpler than week/holiday alignment and retains within-month serial
+dependence even with unequal trade counts per month. Cross-month dependence is not
+preserved; the exchangeability of monthly blocks is an assumption, not a causal claim.
+The seeded 32-bit LCG makes identical requests deterministic.
+
+The reported `pValue` uses `(exceedances + 1) / (iterations + 1)`, counting ties as
+exceedances. `pValueHolm` uses the shared Holm implementation across **all requested
+fields** (refused fields conservatively occupy p=1); one field reports no adjustment.
+No p-value is fabricated for refusal. Named reasons include `too_few_covered_trades`
+(under 30), `too_few_blocks` (under 8 observed months), `no_eligible_threshold`,
+and `permutation_work_limit`. Iterations are capped at **499**. Only when permutation
+is requested, `thresholds` and `percentileSteps` are limited to **100** entries each:
+larger arrays produce the named `permutation_candidate_limit` refusal before any sweep.
+Without permutation, these arrays retain their existing unrestricted schema acceptance.
+Permutation admission then estimates work for every requested field using its covered count
+`n`, requested threshold/percentile count `t` (conservative before deduplication), and
+iterations `r`:
+`(r + 2) × (n × ceil(log2(max(2,n))) + 6nt + 3t × ceil(log2(max(2,2t))))`.
+The estimate includes sorting the values and candidates on every sweep, filtering and
+scoring both directions, plus the observed sweeps. Its limits are **30 million work
+units per field** and **90 million per request**, summed across fields, so a wide
+request cannot multiply the field allowance tenfold. These conservative computational
+limits target a few seconds on ordinary trade logs, not a wall-clock guarantee.
+At **1,100 trades, 55 months, 499 iterations and the seven default thresholds**,
+the conservative estimate is **29,250,384 units per fully covered field**. The largest
+admitted family at this size is **3 fields** (87,751,152 units); 4 fields require
+117,001,536 and are refused. Threshold deduplication does not increase that allowance.
+If either is exceeded the entire request is refused before any field sweep, with
+`permutation_work_limit` (per field) or `permutation_request_work_limit` (request),
+`estimatedWork`, `workLimit`, the requested permutation settings and per-field estimates.
+No block count is calculated for admission refusals. Other refusals return requested
+iterations, block, seed, block count and status.
+These exploratory p-values adjust threshold/field selection within this request.
+Choices of **field, objective and mode across separate requests are not part of the
+Holm family**. Neither repeated exploration nor out-of-sample performance is adjusted.
 
 `suggest_filters.objective` defaults to `totalPl`: admit only positive P&L improvements
 and rank by P&L improvement (win-rate gain breaks ties). Use `winRate` to admit and rank

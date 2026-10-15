@@ -549,6 +549,35 @@ Field-based `suggest_filters` retains all-trade `currentStats` and reports per-f
 Suggestions compare against those covered populations; `filter_curve.baseline`
 reports the same covered and uncovered counts and P&L.
 
+`find_predictive_fields.method` selects `pearson` (default), `spearman`, or `kendall`
+(tau-b with ties). Explicit requests name their method; omission preserves the Pearson
+response. Ranking uses the chosen coefficient on the same causal entry-time values,
+including `maxMissedSessions` refusals.
+Kendall admits up to 75 million estimated pairs across fields, using each field's
+valid field/target coverage after strategy/date filtering. It refuses by name
+(`kendall_pair_work_limit`) before quadratic calculations. A 1,100-trade block with
+100 fully covered fields passes (60,445,000 pairs); a 20,000-trade field is refused.
+Pearson and Spearman retain their existing behavior.
+
+`filter_curve` accepts either the existing `field` or up to 10 distinct `fields`.
+Multi-field calls, an explicit `objective` (`totalPl` or `winRate`), or opt-in
+`permutation: { iterations: 499, block: "month", seed: 42 }` add the best threshold
+and per-year kept/removed stability. Permutation shuffles whole calendar-month outcome
+blocks and reruns the complete threshold sweep, not just the selected threshold.
+It reports add-one raw p-values and Holm-adjusted p-values across requested fields.
+Single-field calls without these options retain their old outputs.
+At least 30 covered trades and 8 observed months are required; refusals are named.
+Iterations are capped at 499. Only permutation requests limit threshold and percentile
+arrays to 100 entries, with a named `permutation_candidate_limit` refusal.
+Without permutation, larger arrays retain their previous schema acceptance.
+Sort-aware work admission caps permutation at 30 million units per field and
+90 million per request, refusing the whole request before any sweeps. At 1,100 trades,
+55 months, 499 iterations and default thresholds, the largest admitted family is
+3 fully covered fields (87,751,152 estimated units); 4 fields exceed the cap.
+Field, objective and mode choices across separate requests are outside the Holm family.
+Monthly blocks retain within-month dependence, not cross-month dependence; block
+exchangeability is an assumption. See [the full contract](../../docs/mcp-tools.md#filter-curve-significance-and-stability).
+
 `suggest_filters` defaults to `objective: "totalPl"`: only positive P&L improvements,
 ranked by P&L improvement with win-rate gain as tie-breaker. `objective: "winRate"`
 admits/ranks by win-rate gain with P&L tie-breaks. `minImprovementPct` (default 3
