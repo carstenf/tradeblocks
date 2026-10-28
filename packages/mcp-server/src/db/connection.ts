@@ -87,7 +87,8 @@
  *
  * Schemas created on first RW connection:
  *   - trades: For block/trade data (in analytics.duckdb)
- *   - market: ATTACHed from market.duckdb (spot, spot_daily, enriched, enriched_context, option_chain, option_quote_minutes, _sync_metadata)
+ *   - market: ATTACHed from market.duckdb (spot/enriched fallback tables and metadata;
+ *     option_chain / option_quote_minutes are always views over Parquet partitions)
  */
 
 import { DuckDBInstance, DuckDBConnection } from "@duckdb/node-api";
@@ -99,6 +100,7 @@ import { promisify } from "util";
 import { ensureSyncTables, ensureTradeDataTable, ensureReportingDataTable } from "./schemas.ts";
 import { ensureMutableMarketTables, ensureMarketDataTables } from "./market-schemas.ts";
 import { ensureProfilesSchema } from "./profile-schemas.ts";
+import { migrateLegacyOptionTables } from "./legacy-option-migration.ts";
 import { createMarketParquetViews } from "./market-views.ts";
 import { migrateMetadataToJson } from "./json-migration.ts";
 import { getDataRoot } from "./data-root.ts";
@@ -435,6 +437,10 @@ async function openReadWriteConnection(
 
   const dataDir = path.dirname(dbPath);
   const dataRoot = getDataRoot(dataDir);
+  // Preserve shipped physical option data before any Parquet view can replace it.
+  // Once migrated, the canonical table names are views (or absent), so later
+  // opens only perform the cheap base-table discovery.
+  await migrateLegacyOptionTables(connection, dataRoot);
 
   // Parquet view overlay: create views over shared Parquet files when present.
   // The env var controls WRITE path; the read path is always opportunistic —
@@ -1060,14 +1066,12 @@ export async function openMarketOnlyConnection(baseDir: string): Promise<MarketO
   // consistent behavior.
   await attachMarketDb(conn, marketDbPath, "read_write");
 
-  // Register views over the canonical market parquet partitions on this
-  // fresh connection. Without this, `SELECT ... FROM market.option_chain`
-  // (and friends) resolve only against the physical tables inside the
-  // attached market.duckdb — which is empty in the parquet-mode deployment
-  // where the partition files are the source of truth. createMarketParquetViews
-  // uses CREATE OR REPLACE so this is idempotent against pre-existing views
-  // inside market.duckdb.
+  // Register views over existing canonical market partitions on this fresh
+  // connection. Options are Parquet-native in both modes; spot/enriched may
+  // also be Parquet-backed. First option publication registers any missing
+  // view in the same connection. CREATE OR REPLACE is idempotent.
   const dataRoot = getDataRoot(baseDir);
+  await migrateLegacyOptionTables(conn, dataRoot);
   await createMarketParquetViews(conn, dataRoot);
 
   let closed = false;

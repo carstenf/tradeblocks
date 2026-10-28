@@ -7,6 +7,7 @@ import {
   type ParquetWriteResult,
 } from "./parquet-writer.ts";
 import { MARKET_DATASETS } from "../market/provenance/dataset-registry.ts";
+import { createMarketParquetViews } from "./market-views.ts";
 
 export type CanonicalSingleFileDataset = "daily" | "date_context";
 export type CanonicalPartitionedDataset = "intraday" | "option_chain" | "option_quote_minutes";
@@ -172,6 +173,31 @@ export async function writeSpotPartition(
   });
 }
 
+// Register the first published option partition on this connection. Existing
+// views glob subsequent partitions automatically; do not rescan the archive on
+// every write. Legacy base tables remain intact until startup migration finishes.
+async function ensureOptionView(
+  conn: DuckDBConnection,
+  dataDir: string,
+  dataset: "option_chain" | "option_quote_minutes",
+): Promise<void> {
+  // Standalone publishers need not attach a market catalog. Only connections
+  // with that catalog expose the SQL read surface.
+  const missing = await conn.runAndReadAll(
+    `SELECT 1 FROM duckdb_databases() WHERE database_name = 'market'
+       AND NOT EXISTS (
+         SELECT 1 FROM information_schema.views
+         WHERE table_catalog = 'market' AND table_schema = 'main' AND table_name = '${dataset}'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM information_schema.tables
+         WHERE table_catalog = 'market' AND table_schema = 'main' AND table_type = 'BASE TABLE'
+           AND table_name IN ('option_chain', 'option_quote_minutes')
+       )`,
+  );
+  if (missing.getRows().length > 0) await createMarketParquetViews(conn, dataDir);
+}
+
 export async function writeChainPartition(
   conn: DuckDBConnection,
   args: {
@@ -185,7 +211,7 @@ export async function writeChainPartition(
 ): Promise<ParquetWriteResult> {
   assertCanonicalPartitionDate(args.date, "writeChainPartition");
   const def = BOUNDED_PROVENANCE_DATASETS.option_chain;
-  return writeParquetPartition(conn, {
+  const result = await writeParquetPartition(conn, {
     baseDir: path.join(resolveMarketDir(args.dataDir), def.subdir),
     partitions: { underlying: args.underlying, date: args.date },
     selectQuery: args.selectQuery,
@@ -205,6 +231,8 @@ export async function writeChainPartition(
       args.quality,
     ),
   });
+  await ensureOptionView(conn, args.dataDir, "option_chain");
+  return result;
 }
 
 export async function writeQuoteMinutesPartition(
@@ -238,7 +266,7 @@ export async function writeQuoteMinutesPartition(
   // re-sort existing partitions. The tool is idempotent (skips
   // already-sorted files via row-group ticker stats).
   const sortedSelect = `SELECT * FROM (${args.selectQuery}) AS q ORDER BY q.ticker, q.time`;
-  return writeParquetPartition(conn, {
+  const result = await writeParquetPartition(conn, {
     baseDir: path.join(resolveMarketDir(args.dataDir), def.subdir),
     partitions: { underlying: args.underlying, date: args.date },
     selectQuery: sortedSelect,
@@ -258,6 +286,8 @@ export async function writeQuoteMinutesPartition(
       args.quality,
     ),
   });
+  await ensureOptionView(conn, args.dataDir, "option_quote_minutes");
+  return result;
 }
 
 export async function writeOiDailyPartition(
