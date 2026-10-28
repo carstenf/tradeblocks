@@ -7,6 +7,9 @@ import { MarketIngestor } from "../market/ingestor/index.ts";
 import type { MarketStores } from "../market/stores/index.ts";
 import type { BulkProgressReporter } from "../market/ingestor/types.ts";
 import { createToolOutput } from "../utils/output-formatter.ts";
+import { importOptionArchive } from "../market/ingestor/option-archive.ts";
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 export function registerMarketFetchTools(
   server: McpServer,
@@ -278,6 +281,89 @@ export function registerMarketFetchTools(
               : dry_run
                 ? `[DRY RUN] Would write ${dataset_type} rows from ${file_path}`
                 : `${result.status}: wrote ${result.rowsWritten} rows to ${dataset_type}`;
+        return createToolOutput(summary, result);
+      } finally {
+        await downgradeToReadOnly(baseDir);
+      }
+    },
+  );
+
+  // import_option_archive
+  server.registerTool(
+    "import_option_archive",
+    {
+      description:
+        "Bulk-import 1-minute option quotes from a local Parquet archive (one file per trading day, e.g. a ThetaData dump) into market.option_chain and market.option_quote_minutes, filtered by date range, DTE range, calls/puts and a strike band. No provider is called.\n\n" +
+        "Archive contract: Parquet files whose path contains the trading day as YYYY-MM-DD, with columns expiration (YYYY-MM-DD), strike (dollars), right (C/P or CALL/PUT), timestamp (TIMESTAMPTZ), bid, ask, and optionally symbol (option root). " +
+        "Per day it writes chain then quotes for partition (underlying, date) and compares the written row counts with a count of the same SELECT.\n\n" +
+        "Each write REPLACES the whole (underlying, date) partition. onExisting='skip' (default) leaves days that already hold option data untouched, so a narrower slice can never delete a broader one and repeated calls resume where the last stopped; use 'replace' only to deliberately rewrite days (e.g. to widen a selection or fix a mismatched day). " +
+        "Known XNYS closures (calendar 2022–2030) are never imported. Start with dryRun=true for the plan and a size estimate; large ranges are processed maxDays at a time and the rest is listed as remaining.",
+      inputSchema: z.object({
+        path: z
+          .string()
+          .describe(
+            "Archive directory (searched recursively for *.parquet) or a glob, e.g. '/data/archive/SPXW/**/*.parquet'. Must be readable by this server.",
+          ),
+        from: z.string().regex(ISO_DATE).describe("First trading day YYYY-MM-DD"),
+        to: z.string().regex(ISO_DATE).describe("Last trading day YYYY-MM-DD"),
+        underlying: z.string().min(1).describe("Target underlying partition, e.g. 'SPX'"),
+        tickerRoot: z
+          .string()
+          .optional()
+          .describe(
+            "Root written into OCC tickers (e.g. 'SPXW'). Default: the file's symbol column, else the underlying.",
+          ),
+        dteMin: z.number().int().min(0).default(0).describe("Minimum calendar days to expiration"),
+        dteMax: z.number().int().min(0).default(0).describe("Maximum calendar days to expiration"),
+        rights: z.enum(["both", "call", "put"]).default("both"),
+        strikePct: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "Keep strikes within ±strikePct % of the day's reference price: the underlying's first market.spot bar, else put-call parity at 09:35 ET from the file.",
+          ),
+        strikeMin: z.number().optional().describe("Absolute lower strike bound"),
+        strikeMax: z.number().optional().describe("Absolute upper strike bound"),
+        exerciseStyle: z
+          .enum(["european", "american"])
+          .optional()
+          .describe(
+            "Default: european for cash-settled index roots (SPX, SPXW, XSP, NDX, RUT, VIX), else american",
+          ),
+        onExisting: z
+          .enum(["skip", "replace"])
+          .default("skip")
+          .describe("Days that already hold option data: 'skip' (default) or 'replace'"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Plan only: classify days and count rows on up to 5 sample days, write nothing",
+          ),
+        maxDays: z
+          .number()
+          .int()
+          .min(1)
+          .max(2000)
+          .default(100)
+          .describe("Maximum days imported per call; the rest is returned as remaining"),
+      }),
+    },
+    async (args) => {
+      const conn = await upgradeToReadWrite(baseDir);
+      try {
+        const result = await importOptionArchive(conn, stores, args);
+        const d = result.days;
+        const summary =
+          result.status === "error"
+            ? `Error: ${result.error}`
+            : result.dryRun
+              ? `[DRY RUN] ${result.estimate?.days ?? 0} days to import (~${result.estimate?.quoteRows ?? 0} quote rows); ` +
+                `${d.skippedExisting.length} existing skipped, ${d.missingInArchive.length} missing in archive, ${d.nonTradingDays.length} closures`
+              : `${result.status}: ${d.ok.length} days imported (${result.rowsWritten.quotes} quote rows), ` +
+                `${d.skippedExisting.length} existing skipped, ${d.mismatched.length} mismatched, ${d.errors.length} errors, ` +
+                `${d.remaining.length} remaining`;
         return createToolOutput(summary, result);
       } finally {
         await downgradeToReadOnly(baseDir);
