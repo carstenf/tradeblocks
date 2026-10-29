@@ -26,8 +26,10 @@
  *
  * Quotes are written before the chain because the quote writer is the one that
  * can refuse (shrink guard). If the chain write then fails, the quote partition
- * is put back as it was (or removed for a new day), so readers keep the
- * previous complete day, or nothing for a new one.
+ * is restored (or removed for a new day). The two files are separate renames, so
+ * a reader can briefly see new quotes with the old chain, and a process killed
+ * between them leaves a half-written day that `skip` reports as present; run
+ * `replace` over such a day to repair it.
  */
 import { copyFileSync, linkSync, renameSync, statSync, unlinkSync } from "fs";
 import * as path from "path";
@@ -84,6 +86,10 @@ export interface ImportOptionArchiveResult {
     skippedExisting: string[];
     missingInArchive: string[];
     nonTradingDays: string[];
+    /** Imported weekdays outside the 2022–2030 XNYS calendar: a holiday there is not recognised. */
+    unclassifiedDays: string[];
+    /** Imported days whose rows include timestamps on another America/New_York date than the path. */
+    offDateRows: { date: string; rows: number }[];
     noMatchingRows: string[];
     noReferencePrice: string[];
     mismatched: { date: string; expected: DayCount; written: DayCount }[];
@@ -91,6 +97,8 @@ export interface ImportOptionArchiveResult {
     remaining: string[];
   };
   rowsWritten: { chain: number; quotes: number };
+  /** Strike-band reference per day when strikePct is set: first spot open, else 09:35 ET parity. */
+  strikeReference?: { date: string; source: "spot_open" | "parity"; price: number }[];
   estimate?: { days: number; quoteRows: number; chainRows: number; sampledDays: number };
   error?: string;
 }
@@ -129,9 +137,13 @@ export function filesByDate(files: readonly string[]): Map<string, string[]> {
 }
 
 /** Weekdays in [from, to] split into candidate sessions and known closures. */
-export function candidateDays(from: string, to: string): { sessions: string[]; closed: string[] } {
+export function candidateDays(
+  from: string,
+  to: string,
+): { sessions: string[]; closed: string[]; unclassified: Set<string> } {
   const sessions: string[] = [];
   const closed: string[] = [];
+  const unclassified = new Set<string>();
   const end = new Date(`${to}T12:00:00Z`).getTime();
   for (
     let d = new Date(`${from}T12:00:00Z`);
@@ -145,8 +157,9 @@ export function candidateDays(from: string, to: string): { sessions: string[]; c
       iso >= XNYS_SESSION_CALENDAR_SUPPORTED_FROM && iso <= XNYS_SESSION_CALENDAR_SUPPORTED_THROUGH;
     if (inCalendar && !isXnysSessionDate(iso)) closed.push(iso);
     else sessions.push(iso);
+    if (!inCalendar) unclassified.add(iso);
   }
-  return { sessions, closed };
+  return { sessions, closed, unclassified };
 }
 
 export function sourceRelation(files: readonly string[]): string {
@@ -369,8 +382,10 @@ async function spotOpens(
       )
     ).getRows();
     for (const [d, o] of rows) if (o !== null) out.set(String(d).slice(0, 10), Number(o));
-  } catch {
-    // no spot data → parity fallback per day
+  } catch (err) {
+    // Only a missing spot view means "no spot data"; any other read error must surface.
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/does not exist|not found/i.test(message)) throw err;
   }
   return out;
 }
@@ -442,13 +457,21 @@ async function writeDay(
     const reason = err instanceof Error ? err.message : String(err);
     try {
       restore(files.quote, quoteBackup);
-      await createMarketParquetViews(conn, dataDir);
     } catch (restoreErr) {
       const why = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
       throw new Error(
         `chain write failed (${reason}) and restoring the quote partition failed (${why}); ` +
           `check ${files.quote}` +
           (quoteBackup ? ` (previous version kept at ${quoteBackup})` : ""),
+      );
+    }
+    try {
+      await createMarketParquetViews(conn, dataDir);
+    } catch (viewErr) {
+      const why = viewErr instanceof Error ? viewErr.message : String(viewErr);
+      throw new Error(
+        `chain write failed (${reason}); quote partition restored to its previous state, ` +
+          `but refreshing the market views failed (${why}); restart the server to rebuild them`,
       );
     }
     throw new Error(
@@ -475,6 +498,8 @@ export async function importOptionArchive(
       skippedExisting: [],
       missingInArchive: [],
       nonTradingDays: [],
+      unclassifiedDays: [],
+      offDateRows: [],
       noMatchingRows: [],
       noReferencePrice: [],
       mismatched: [],
@@ -489,6 +514,14 @@ export async function importOptionArchive(
     error,
   });
 
+  if (!/^[A-Z0-9._-]+$/.test(underlying) || underlying === "." || underlying === "..") {
+    return fail(
+      `invalid underlying ${JSON.stringify(opts.underlying)}: use letters, digits, '.', '_' or '-'`,
+    );
+  }
+  if (opts.tickerRoot !== undefined && !/^[A-Za-z0-9]+$/.test(opts.tickerRoot)) {
+    return fail(`invalid tickerRoot ${JSON.stringify(opts.tickerRoot)}: use letters and digits`);
+  }
   if (opts.from > opts.to) return fail(`from (${opts.from}) is after to (${opts.to})`);
   if (opts.dteMin > opts.dteMax) return fail("dteMin must be <= dteMax");
   const dataDir = getMarketStoresAuthority(stores)?.dataRoot;
@@ -504,7 +537,7 @@ export async function importOptionArchive(
   const byDate = filesByDate(files);
   result.filesFound = files.length;
 
-  const { sessions, closed } = candidateDays(opts.from, opts.to);
+  const { sessions, closed, unclassified } = candidateDays(opts.from, opts.to);
   result.days.nonTradingDays = closed;
   const opens =
     opts.strikePct !== undefined
@@ -552,12 +585,17 @@ export async function importOptionArchive(
       const described = await describeSource(conn, source);
       let band = strikeBand(opts, null);
       if (opts.strikePct !== undefined) {
-        const reference =
-          opens.get(day) ?? (await parityReference(conn, source, described.instant));
+        const spot = opens.get(day);
+        const reference = spot ?? (await parityReference(conn, source, described.instant));
         if (reference === null) {
           result.days.noReferencePrice.push(day);
           continue;
         }
+        (result.strikeReference ??= []).push({
+          date: day,
+          source: spot !== undefined ? "spot_open" : "parity",
+          price: reference,
+        });
         band = strikeBand(opts, reference);
       }
       const rootExpr = opts.tickerRoot
@@ -577,8 +615,16 @@ export async function importOptionArchive(
         result.days.noMatchingRows.push(day);
         continue;
       }
+      const offDate = Number(
+        await scalar(
+          conn,
+          `SELECT count(*) FROM ${source} WHERE ${where} AND ` +
+            `CAST(timezone('America/New_York', ${described.instant}) AS DATE) <> DATE ${sqlLiteral(day)}`,
+        ),
+      );
       if (opts.dryRun) {
         result.days.planned.push(expected);
+        if (offDate > 0) result.days.offDateRows.push({ date: day, rows: offDate });
         continue;
       }
       const partition = { underlying, date: day };
@@ -597,6 +643,8 @@ export async function importOptionArchive(
       };
       result.rowsWritten.chain += chain.rowCount;
       result.rowsWritten.quotes += quotes.rowCount;
+      if (offDate > 0) result.days.offDateRows.push({ date: day, rows: offDate });
+      if (unclassified.has(day)) result.days.unclassifiedDays.push(day);
       if (written.chainRows === expected.chainRows && written.quoteRows === expected.quoteRows) {
         result.days.ok.push(written);
       } else {

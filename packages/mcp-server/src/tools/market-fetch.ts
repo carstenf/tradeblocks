@@ -295,9 +295,9 @@ export function registerMarketFetchTools(
       description:
         "Bulk-import 1-minute option quotes from a local Parquet archive (one file per trading day, e.g. a ThetaData dump) into market.option_chain and market.option_quote_minutes, filtered by date range, DTE range, calls/puts and a strike band. No provider is called.\n\n" +
         "Archive contract: Parquet files whose path contains the trading day as YYYY-MM-DD, with columns expiration (YYYY-MM-DD), strike (dollars), right (C/P or CALL/PUT), timestamp (TIMESTAMPTZ, or naive TIMESTAMP read as America/New_York), bid, ask, and optionally symbol (option root). " +
-        "Per day it writes chain then quotes for partition (underlying, date) and compares the written row counts with a count of the same SELECT.\n\n" +
+        "Per day it writes quotes, then chain, for partition (underlying, date), restores the quote partition if the chain write fails, and compares the written row counts with a count of the same SELECT; a day left half-written by an interrupted run is repaired with onExisting='replace'.\n\n" +
         "Each write REPLACES the whole (underlying, date) partition. onExisting='skip' (default) leaves days that already hold option data untouched, so a narrower slice can never delete a broader one and repeated calls resume where the last stopped; use 'replace' only to deliberately rewrite days (e.g. to widen a selection or fix a mismatched day). " +
-        "Known XNYS closures (calendar 2022–2030) are never imported. Start with dryRun=true for the plan and a size estimate; large ranges are processed maxDays at a time and the rest is listed as remaining.",
+        "Known XNYS closures (calendar 2022–2030) are never imported; outside that calendar only weekends are excluded, and imported out-of-calendar days are listed in days.unclassifiedDays. Start with dryRun=true for the plan and a size estimate; large ranges are processed maxDays at a time and the rest is listed as remaining.",
       inputSchema: z.object({
         path: z
           .string()

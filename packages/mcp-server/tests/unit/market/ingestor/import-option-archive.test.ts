@@ -36,9 +36,13 @@ type Result = {
     mismatched: { date: string }[];
     errors: { date: string; error: string }[];
     remaining: string[];
+    unclassifiedDays: string[];
+    offDateRows: { date: string; rows: number }[];
   };
   rowsWritten: { chain: number; quotes: number };
+  strikeReference?: { date: string; source: string; price: number }[];
   estimate?: { days: number };
+  error?: string;
 };
 
 /** One day file: two expirations (same day and +7), strikes 5900/6000/6100, C+P, two minutes. */
@@ -203,6 +207,7 @@ describe("import_option_archive", () => {
     expect(r.days.remaining).toEqual(["2026-01-20"]);
     // parity reference = 6000 → band 5940..6060 keeps strike 6000 only; puts, 2 expirations
     expect(r.days.ok).toEqual([{ date: "2026-01-16", chainRows: 2, quoteRows: 4 }]);
+    expect(r.strikeReference).toEqual([{ date: "2026-01-16", source: "parity", price: 6000 }]);
     const tickers = (await stores.chain.readChain("SPX", "2026-01-16")).map((c) => c.ticker).sort();
     expect(tickers).toEqual(["SPX260116P06000000", "SPX260123P06000000"]);
   });
@@ -314,6 +319,45 @@ describe("import_option_archive", () => {
     );
     expect(ns).toBe(Date.parse("2026-01-16T14:35:00Z") * 1e6);
   });
+  it("refuses an underlying or ticker root that is not a plain symbol", async () => {
+    for (const args of [
+      { underlying: "../../victim" },
+      { underlying: ".." },
+      { tickerRoot: "SPX/../X" },
+    ]) {
+      const out = await client.callTool({
+        name: "import_option_archive",
+        arguments: {
+          path: archive,
+          underlying: "SPX",
+          from: "2026-01-16",
+          to: "2026-01-16",
+          ...args,
+        },
+      });
+      const r = out.structuredContent as unknown as Result & { status: string };
+      expect(r.status).toBe("error");
+      expect(r.error).toMatch(/invalid (underlying|tickerRoot)/);
+    }
+  });
+
+  it("lists imported out-of-calendar days and rows dated off the file's day", async () => {
+    // 2021-12-24 is an XNYS holiday before the bundled calendar; the file is imported, flagged.
+    await writeDayFile(archive, "2021-12-24");
+    // A file named 2026-01-22 whose rows are stamped 2026-01-20 (a misnamed copy).
+    const misnamed = join(dataDir, "misnamed");
+    mkdirSync(misnamed, { recursive: true });
+    await getCurrentConnection().run(
+      `COPY (SELECT * FROM read_parquet('${join(archive, "SPXW", "2026", "2026-01-20.parquet")}')) ` +
+        `TO '${join(misnamed, "2026-01-22.parquet")}' (FORMAT PARQUET)`,
+    );
+    const old = await call({ from: "2021-12-24", to: "2021-12-24" });
+    expect(old.days.ok.map((d) => d.date)).toEqual(["2021-12-24"]);
+    expect(old.days.unclassifiedDays).toEqual(["2021-12-24"]);
+    const off = await call({ path: misnamed, from: "2026-01-22", to: "2026-01-22", dteMax: 7 });
+    expect(off.days.offDateRows).toEqual([{ date: "2026-01-22", rows: 12 }]);
+    expect(off.days.unclassifiedDays).toEqual([]);
+  });
 });
 
 describe("option-archive helpers", () => {
@@ -330,6 +374,7 @@ describe("option-archive helpers", () => {
     expect(candidateDays("2026-01-16", "2026-01-20")).toEqual({
       sessions: ["2026-01-16", "2026-01-20"],
       closed: ["2026-01-19"],
+      unclassified: new Set(),
     });
     expect(candidateDays("2020-01-17", "2020-01-20").sessions).toEqual([
       "2020-01-17",

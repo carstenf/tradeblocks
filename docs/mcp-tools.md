@@ -141,11 +141,14 @@ for example a ThetaData dump) into `market.option_chain` and
 
 **Behaviour.** Per day the tool writes the quotes, then the chain, for partition
 `(underlying, date)` through `writeFromSelect` and compares the written row
-counts with a count of the same SELECT. The pair is published together: if the
+counts with a count of the same SELECT. On a failed write the day is restored: if the
 quote write is refused (for example by the quote store's shrink guard) nothing
 is written, and if the chain write fails the quote partition is restored to its
 previous state (removed for a new day); either way the day is reported in
-`days.errors` and readers keep the previous complete day. A write replaces the **whole**
+`days.errors` and readers keep the previous complete day. Quotes and chain are two
+separate file renames, so a reader can briefly see the new quotes with the old chain,
+and a process killed between them leaves a half-written day that `skip` reports as
+present; run `onExisting: "replace"` over such a day to repair it. A write replaces the **whole**
 partition, so the default `onExisting: "skip"` guarantees that importing a
 narrower slice never deletes a broader one, and repeated calls resume where the
 previous call stopped. Existence is checked on the partition files; when it
@@ -157,8 +160,12 @@ them; before 2022 only weekends are excluded.
 
 **Result.** `days.ok`, `days.planned` (dry run), `days.skippedExisting`,
 `days.missingInArchive`, `days.nonTradingDays`, `days.noMatchingRows`,
-`days.noReferencePrice`, `days.mismatched` (expected vs written counts),
-`days.errors`, `days.remaining`, `rowsWritten`, and for a dry run an
+`days.noReferencePrice`, `days.unclassifiedDays` (imported weekdays outside the
+2022–2030 calendar, where a holiday is not recognised), `days.offDateRows` (days whose
+selected rows include timestamps on another New York date than the file path; the
+rows are still written under the path date), `days.mismatched` (expected vs written counts),
+`days.errors`, `days.remaining`, `rowsWritten`, `strikeReference` (per day with
+`strikePct`: `spot_open` or `parity` and the price used), and for a dry run an
 `estimate` extrapolated from the sampled days. `status` is `partial` when any
 day mismatched, failed or remains. A mismatched day has been written; re-run it
 with `onExisting: "replace"`.

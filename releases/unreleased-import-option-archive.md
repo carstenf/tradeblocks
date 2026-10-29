@@ -11,7 +11,12 @@ range, DTE, rights and strike band, with a per-day row-count check and a
   `onExisting: "replace"` rewrites them. When it cannot be determined
   whether a day holds data, the day is reported in `days.errors` and not
   written.
-- Quotes and chain of a day are published together: if either write fails,
-  readers keep the previous complete day (or nothing for a new day).
+- A failed write restores the day: a refused quote write publishes nothing, and
+  a failed chain write restores the previous quote partition (or removes it for
+  a new day). A day left half-written by an interrupted run is repaired with
+  `onExisting: "replace"`.
+- The result lists imported out-of-calendar days (`days.unclassifiedDays`), rows
+  dated off the file's day (`days.offDateRows`) and the strike reference used
+  per day (`strikeReference`). `underlying` and `tickerRoot` are validated.
 - A naive `timestamp` column is read as America/New_York wall-clock time;
   results do not depend on the host time zone.
