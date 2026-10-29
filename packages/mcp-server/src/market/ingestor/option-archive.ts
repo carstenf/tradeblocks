@@ -7,23 +7,34 @@
  *   expiration  'YYYY-MM-DD' (VARCHAR or DATE)
  *   strike      DOUBLE (dollars)
  *   right       'C' | 'P' | 'CALL' | 'PUT'
- *   timestamp   TIMESTAMP WITH TIME ZONE (or a timestamp in America/New_York)
+ *   timestamp   TIMESTAMP WITH TIME ZONE, or a naive TIMESTAMP read as America/New_York
  *   bid, ask    DOUBLE
  *   symbol      optional option root (e.g. 'SPXW'); default ticker root
  *
  * Each file is mapped to its trading day by the last YYYY-MM-DD in its path. Per
  * day the importer filters the file (DTE range, rights, strike band), writes the
- * `option_chain` and `option_quote_minutes` partitions for (underlying, date)
+ * `option_quote_minutes` and `option_chain` partitions for (underlying, date)
  * through the stores' `writeFromSelect`, and checks the written row counts
  * against a count of the same SELECT.
  *
  * A write replaces the whole (underlying, date) partition, so a day that already
  * holds data is skipped unless the caller asks for `onExisting: "replace"`;
  * a narrower slice can then never silently delete a broader one. Skipping also
- * makes repeated calls resume where the previous call stopped.
+ * makes repeated calls resume where the previous call stopped. Existence is
+ * probed on the partition files; a day whose existence cannot be determined is
+ * reported in `errors` and never written.
+ *
+ * Quotes are written before the chain because the quote writer is the one that
+ * can refuse (shrink guard). If the chain write then fails, the quote partition
+ * is put back as it was (or removed for a new day), so readers keep the
+ * previous complete day, or nothing for a new one.
  */
+import { copyFileSync, linkSync, renameSync, statSync, unlinkSync } from "fs";
+import * as path from "path";
 import type { DuckDBConnection } from "@duckdb/node-api";
-import type { MarketStores } from "../stores/index.ts";
+import { getMarketStoresAuthority, type MarketStores } from "../stores/index.ts";
+import { resolveCanonicalMarketPartitionDir } from "../../db/market-datasets.ts";
+import { createMarketParquetViews } from "../../db/market-views.ts";
 import {
   XNYS_SESSION_CALENDAR_SUPPORTED_FROM,
   XNYS_SESSION_CALENDAR_SUPPORTED_THROUGH,
@@ -143,6 +154,27 @@ export function sourceRelation(files: readonly string[]): string {
   return `read_parquet([${list}], hive_partitioning = false, union_by_name = true)`;
 }
 
+/**
+ * Instant expression for the source `timestamp` column, independent of the
+ * host / DuckDB session time zone: TIMESTAMPTZ is used as is, a naive
+ * TIMESTAMP is read as America/New_York wall-clock time. Other types are refused.
+ */
+export function timestampInstantExpr(columnType: string): string {
+  const t = columnType.toUpperCase();
+  if (t === "TIMESTAMP WITH TIME ZONE" || t === "TIMESTAMPTZ") return `"timestamp"`;
+  if (/^TIMESTAMP(_S|_MS|_NS)?$/.test(t)) {
+    return `timezone('America/New_York', CAST("timestamp" AS TIMESTAMP))`;
+  }
+  throw new Error(
+    `unsupported timestamp column type ${columnType}; expected TIMESTAMP WITH TIME ZONE ` +
+      `or a naive TIMESTAMP in America/New_York`,
+  );
+}
+
+/** HH:MM in America/New_York for an instant expression. */
+const ET_MINUTE = (instant: string) =>
+  `strftime(timezone('America/New_York', ${instant}), '%H:%M')`;
+
 const DTE_EXPR = (day: string) =>
   `date_diff('day', DATE ${sqlLiteral(day)}, CAST(expiration AS DATE))`;
 
@@ -191,14 +223,15 @@ export function quotesSelect(
   where: string,
   underlying: string,
   rootExpr: string,
+  instant: string = `"timestamp"`,
 ): string {
   return (
     `SELECT ${sqlLiteral(underlying)} AS underlying, ${sqlLiteral(day)} AS date, ` +
     `${tickerExpr(rootExpr)} AS ticker, ` +
-    `strftime(timezone('America/New_York', CAST("timestamp" AS TIMESTAMPTZ)), '%H:%M') AS time, ` +
+    `${ET_MINUTE(instant)} AS time, ` +
     `round(bid, 2) AS bid, round(ask, 2) AS ask, ` +
     `CASE WHEN ask > 0 THEN round((bid + ask) / 2, 3) END AS mid, ` +
-    `epoch_ns(CAST("timestamp" AS TIMESTAMPTZ)) AS last_updated_ns, 'nbbo' AS source ` +
+    `epoch_ns(${instant}) AS last_updated_ns, 'nbbo' AS source ` +
     `FROM ${source} WHERE ${where}`
   );
 }
@@ -221,6 +254,90 @@ export function strikeBand(
   };
 }
 
+// ---------------------------------------------------------------- partition files
+
+export type DayExistence = "present" | "absent" | { unknown: string };
+
+interface PartitionFiles {
+  chain: string;
+  quote: string;
+}
+
+function partitionFiles(dataDir: string, underlying: string, day: string): PartitionFiles {
+  const file = (dataset: "option_chain" | "option_quote_minutes") =>
+    path.join(
+      resolveCanonicalMarketPartitionDir(dataDir, dataset),
+      `underlying=${underlying}`,
+      `date=${day}`,
+      "data.parquet",
+    );
+  return { chain: file("option_chain"), quote: file("option_quote_minutes") };
+}
+
+/** true / false from the file system; throws on anything but "does not exist". */
+function fileExists(file: string): boolean {
+  try {
+    statSync(file);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+/**
+ * Whether (underlying, day) already holds option data, probed on the partition
+ * files. Fails closed: a probe error, or a legacy date-only chain partition for
+ * the day (whose underlyings its path does not show), is `unknown`, never `absent`.
+ */
+export function dayExistence(dataDir: string, underlying: string, day: string): DayExistence {
+  try {
+    const files = partitionFiles(dataDir, underlying, day);
+    if (fileExists(files.chain) || fileExists(files.quote)) return "present";
+    const legacy = path.join(
+      resolveCanonicalMarketPartitionDir(dataDir, "option_chain"),
+      `date=${day}`,
+      "data.parquet",
+    );
+    if (fileExists(legacy)) {
+      return { unknown: `a legacy date-only option_chain partition exists for ${day}` };
+    }
+    return "absent";
+  } catch (err) {
+    return { unknown: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Keep the current file (if any) under a backup name. A hard link is enough
+ * because the writer publishes by rename, which leaves the old inode intact.
+ */
+function snapshot(file: string): string | null {
+  if (!fileExists(file)) return null;
+  const backup = `${file}.import-backup-${process.pid}-${Date.now()}`;
+  try {
+    linkSync(file, backup);
+  } catch {
+    copyFileSync(file, backup);
+  }
+  return backup;
+}
+
+function discard(backup: string | null): void {
+  if (!backup) return;
+  try {
+    unlinkSync(backup);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Put a file back to its snapshot, or remove it when there was none. */
+function restore(file: string, backup: string | null): void {
+  if (backup) renameSync(backup, file);
+  else if (fileExists(file)) unlinkSync(file);
+}
+
 // ---------------------------------------------------------------- DB helpers
 
 async function scalar(conn: DuckDBConnection, sql: string): Promise<unknown> {
@@ -234,26 +351,6 @@ export async function listArchiveFiles(conn: DuckDBConnection, path: string): Pr
     await conn.runAndReadAll(`SELECT file FROM glob(${sqlLiteral(pattern)}) ORDER BY file`)
   ).getRows();
   return rows.map((r) => String(r[0]));
-}
-
-async function dayExists(
-  conn: DuckDBConnection,
-  underlying: string,
-  day: string,
-): Promise<boolean> {
-  const u = sqlLiteral(underlying);
-  const d = sqlLiteral(day);
-  for (const table of ["market.option_chain", "market.option_quote_minutes"]) {
-    try {
-      const hit = await conn.runAndReadAll(
-        `SELECT 1 FROM ${table} WHERE underlying = ${u} AND date = ${d} LIMIT 1`,
-      );
-      if (hit.getRows().length > 0) return true;
-    } catch {
-      // view not created yet (no option data at all) → nothing exists
-    }
-  }
-  return false;
 }
 
 async function spotOpens(
@@ -282,12 +379,13 @@ async function spotOpens(
 export async function parityReference(
   conn: DuckDBConnection,
   source: string,
+  instant: string = `"timestamp"`,
 ): Promise<number | null> {
   const v = await scalar(
     conn,
     `WITH q AS (SELECT CAST(expiration AS DATE) AS e, strike, upper(left("right", 1)) AS r, (bid + ask) / 2 AS mid
                 FROM ${source}
-                WHERE strftime(timezone('America/New_York', CAST("timestamp" AS TIMESTAMPTZ)), '%H:%M') = '09:35'
+                WHERE ${ET_MINUTE(instant)} = '09:35'
                   AND bid > 0 AND ask > 0),
           n AS (SELECT min(e) AS e FROM q)
      SELECT c.strike + c.mid - p.mid FROM q c JOIN q p USING (e, strike), n
@@ -297,12 +395,67 @@ export async function parityReference(
   return v === null ? null : Number(v);
 }
 
-async function hasSymbolColumn(conn: DuckDBConnection, source: string): Promise<boolean> {
+/** Whether the file has a `symbol` column, and the instant expression for its `timestamp`. */
+async function describeSource(
+  conn: DuckDBConnection,
+  source: string,
+): Promise<{ hasSymbol: boolean; instant: string }> {
   const rows = (await conn.runAndReadAll(`DESCRIBE SELECT * FROM ${source}`)).getRows();
-  return rows.some((r) => String(r[0]) === "symbol");
+  const ts = rows.find((r) => String(r[0]) === "timestamp");
+  if (!ts) throw new Error("archive file has no timestamp column");
+  return {
+    hasSymbol: rows.some((r) => String(r[0]) === "symbol"),
+    instant: timestampInstantExpr(String(ts[1])),
+  };
 }
 
 // ---------------------------------------------------------------- orchestration
+
+/**
+ * Write one day as a pair: quotes first (the write that can refuse), chain
+ * second. A failed quote write publishes nothing; a failed chain write puts the
+ * quote partition back as it was, so readers keep the previous complete day
+ * (or, for a new day, nothing).
+ */
+async function writeDay(
+  conn: DuckDBConnection,
+  stores: MarketStores,
+  dataDir: string,
+  partition: { underlying: string; date: string },
+  chainSql: string,
+  quoteSql: string,
+): Promise<{ chain: { rowCount: number }; quotes: { rowCount: number } }> {
+  const files = partitionFiles(dataDir, partition.underlying, partition.date);
+  const quoteBackup = snapshot(files.quote);
+  let quotes: { rowCount: number };
+  try {
+    quotes = await stores.quote.writeFromSelect(partition, quoteSql);
+  } catch (err) {
+    discard(quoteBackup);
+    throw err;
+  }
+  try {
+    const chain = await stores.chain.writeFromSelect(partition, chainSql);
+    discard(quoteBackup);
+    return { chain, quotes };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    try {
+      restore(files.quote, quoteBackup);
+      await createMarketParquetViews(conn, dataDir);
+    } catch (restoreErr) {
+      const why = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
+      throw new Error(
+        `chain write failed (${reason}) and restoring the quote partition failed (${why}); ` +
+          `check ${files.quote}` +
+          (quoteBackup ? ` (previous version kept at ${quoteBackup})` : ""),
+      );
+    }
+    throw new Error(
+      `chain write failed (${reason}); quote partition restored to its previous state`,
+    );
+  }
+}
 
 export async function importOptionArchive(
   conn: DuckDBConnection,
@@ -338,6 +491,9 @@ export async function importOptionArchive(
 
   if (opts.from > opts.to) return fail(`from (${opts.from}) is after to (${opts.to})`);
   if (opts.dteMin > opts.dteMax) return fail("dteMin must be <= dteMax");
+  const dataDir = getMarketStoresAuthority(stores)?.dataRoot;
+  if (!dataDir)
+    return fail("market stores carry no data root; option partitions cannot be located");
 
   let files: string[];
   try {
@@ -366,10 +522,20 @@ export async function importOptionArchive(
   for (const day of sessions) {
     if (!byDate.has(day)) {
       result.days.missingInArchive.push(day);
-    } else if (opts.onExisting === "skip" && (await dayExists(conn, underlying, day))) {
-      result.days.skippedExisting.push(day);
-    } else {
+      continue;
+    }
+    if (opts.onExisting === "replace") {
       work.push(day);
+      continue;
+    }
+    const existence = dayExistence(dataDir, underlying, day);
+    if (existence === "present") result.days.skippedExisting.push(day);
+    else if (existence === "absent") work.push(day);
+    else {
+      result.days.errors.push({
+        date: day,
+        error: `cannot determine whether the day already holds data (${existence.unknown}); not written`,
+      });
     }
   }
 
@@ -383,9 +549,11 @@ export async function importOptionArchive(
   for (const day of sample) {
     const source = sourceRelation(byDate.get(day)!);
     try {
+      const described = await describeSource(conn, source);
       let band = strikeBand(opts, null);
       if (opts.strikePct !== undefined) {
-        const reference = opens.get(day) ?? (await parityReference(conn, source));
+        const reference =
+          opens.get(day) ?? (await parityReference(conn, source, described.instant));
         if (reference === null) {
           result.days.noReferencePrice.push(day);
           continue;
@@ -394,12 +562,12 @@ export async function importOptionArchive(
       }
       const rootExpr = opts.tickerRoot
         ? sqlLiteral(opts.tickerRoot.toUpperCase())
-        : (await hasSymbolColumn(conn, source))
+        : described.hasSymbol
           ? "upper(symbol)"
           : sqlLiteral(underlying);
       const where = archiveWhere(day, opts, band);
       const chainSql = chainSelect(day, source, where, underlying, rootExpr, exerciseStyle);
-      const quoteSql = quotesSelect(day, source, where, underlying, rootExpr);
+      const quoteSql = quotesSelect(day, source, where, underlying, rootExpr, described.instant);
       const expected: DayCount = {
         date: day,
         chainRows: Number(await scalar(conn, `SELECT count(*) FROM (${chainSql})`)),
@@ -414,8 +582,14 @@ export async function importOptionArchive(
         continue;
       }
       const partition = { underlying, date: day };
-      const chain = await stores.chain.writeFromSelect(partition, chainSql);
-      const quotes = await stores.quote.writeFromSelect(partition, quoteSql);
+      const { chain, quotes } = await writeDay(
+        conn,
+        stores,
+        dataDir,
+        partition,
+        chainSql,
+        quoteSql,
+      );
       const written: DayCount = {
         date: day,
         chainRows: chain.rowCount,

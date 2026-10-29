@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { mkdirSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -17,7 +17,9 @@ import {
   candidateDays,
   filesByDate,
   strikeBand,
+  timestampInstantExpr,
 } from "../../../../src/market/ingestor/option-archive.ts";
+import { resolveCanonicalMarketPartitionDir } from "../../../../src/db/market-datasets.ts";
 
 // 2026-01-16 Fri, 2026-01-19 MLK holiday (file present, must never be imported),
 // 2026-01-20 Tue, 2026-01-21 Wed (no file).
@@ -32,6 +34,7 @@ type Result = {
     missingInArchive: string[];
     nonTradingDays: string[];
     mismatched: { date: string }[];
+    errors: { date: string; error: string }[];
     remaining: string[];
   };
   rowsWritten: { chain: number; quotes: number };
@@ -56,6 +59,20 @@ async function writeDayFile(dir: string, day: string): Promise<void> {
       FROM (VALUES (0), (7)) e(e), (VALUES (5900), (6000), (6100)) k(k),
            (VALUES ('CALL'), ('PUT')) r(r), (VALUES (0), (1)) m(m)
     ) TO '${target}' (FORMAT PARQUET)`);
+}
+
+/** Same day layout as writeDayFile, but with a naive TIMESTAMP in New York wall-clock time. */
+async function writeNaiveDayFile(dir: string, day: string): Promise<void> {
+  const conn = getCurrentConnection();
+  mkdirSync(dir, { recursive: true });
+  await conn.run(`
+    COPY (
+      SELECT 'SPXW' AS symbol, CAST(DATE '${day}' AS VARCHAR) AS expiration,
+             CAST(k AS DOUBLE) AS strike, r AS "right",
+             CAST(TIMESTAMP '${day} 09:35:00' + INTERVAL (m) MINUTE AS TIMESTAMP) AS "timestamp",
+             10.0 AS bid, 11.0 AS ask
+      FROM (VALUES (5900), (6000), (6100)) k(k), (VALUES ('CALL'), ('PUT')) r(r), (VALUES (0), (1)) m(m)
+    ) TO '${join(dir, `${day}.parquet`)}' (FORMAT PARQUET)`);
 }
 
 describe("import_option_archive", () => {
@@ -189,6 +206,114 @@ describe("import_option_archive", () => {
     const tickers = (await stores.chain.readChain("SPX", "2026-01-16")).map((c) => c.ticker).sort();
     expect(tickers).toEqual(["SPX260116P06000000", "SPX260123P06000000"]);
   });
+  const partitionFile = (dataset: "option_chain" | "option_quote_minutes", day: string) =>
+    join(
+      resolveCanonicalMarketPartitionDir(dataDir, dataset),
+      "underlying=SPX",
+      `date=${day}`,
+      "data.parquet",
+    );
+  const chainCount = (day: string) =>
+    count(`SELECT count(*) FROM market.option_chain WHERE underlying='SPX' AND date='${day}'`);
+  const quoteCount = (day: string) =>
+    count(
+      `SELECT count(*) FROM market.option_quote_minutes WHERE underlying='SPX' AND date='${day}'`,
+    );
+  const leftoverBackups = (day: string) =>
+    readdirSync(join(partitionFile("option_quote_minutes", day), "..")).filter((f) =>
+      f.includes("import-backup"),
+    );
+
+  it("a replace the quote store refuses publishes nothing and keeps the previous day", async () => {
+    await call({ from: "2026-01-16", to: "2026-01-16", dteMax: 7 }); // 12 contracts, 24 quotes
+    // puts at 0 DTE only: 6 quotes < 50% of 24 → quote shrink guard refuses
+    const r = await call({
+      from: "2026-01-16",
+      to: "2026-01-16",
+      rights: "put",
+      onExisting: "replace",
+    });
+    expect(r.status).toBe("partial");
+    expect(r.days.ok).toEqual([]);
+    expect(r.days.errors.map((e) => e.date)).toEqual(["2026-01-16"]);
+    expect(await chainCount("2026-01-16")).toBe(12);
+    expect(await quoteCount("2026-01-16")).toBe(24);
+    expect(leftoverBackups("2026-01-16")).toEqual([]);
+  });
+
+  it("a failed chain write after a replace restores the previous quote partition", async () => {
+    await call({ from: "2026-01-16", to: "2026-01-16" }); // 6 contracts, 12 quotes
+    jest.spyOn(stores.chain, "writeFromSelect").mockRejectedValueOnce(new Error("disk full"));
+    const r = await call({
+      from: "2026-01-16",
+      to: "2026-01-16",
+      dteMax: 7,
+      onExisting: "replace",
+    });
+    expect(r.days.ok).toEqual([]);
+    expect(r.days.errors).toEqual([
+      {
+        date: "2026-01-16",
+        error: expect.stringContaining("quote partition restored to its previous state"),
+      },
+    ]);
+    expect(await chainCount("2026-01-16")).toBe(6);
+    expect(await quoteCount("2026-01-16")).toBe(12);
+    expect(leftoverBackups("2026-01-16")).toEqual([]);
+  });
+
+  it("a failed chain write on a new day leaves no quote partition behind", async () => {
+    await call({ from: "2026-01-20", to: "2026-01-20" }); // another day, so the views exist
+    jest.spyOn(stores.chain, "writeFromSelect").mockRejectedValueOnce(new Error("disk full"));
+    const r = await call({ from: "2026-01-16", to: "2026-01-16" });
+    expect(r.days.errors.map((e) => e.date)).toEqual(["2026-01-16"]);
+    expect(existsSync(partitionFile("option_quote_minutes", "2026-01-16"))).toBe(false);
+    expect(existsSync(partitionFile("option_chain", "2026-01-16"))).toBe(false);
+    expect(await quoteCount("2026-01-16")).toBe(0);
+    expect(await quoteCount("2026-01-20")).toBe(12);
+  });
+
+  it("skip fails closed when existence cannot be determined", async () => {
+    const legacyDir = join(
+      resolveCanonicalMarketPartitionDir(dataDir, "option_chain"),
+      "date=2026-01-16",
+    );
+    mkdirSync(legacyDir, { recursive: true });
+    // a legacy date-only chain partition: its path does not say which underlyings it holds
+    await getCurrentConnection().run(
+      `COPY (SELECT 'SPX' AS underlying, 'SPXW260116C06000000' AS ticker) ` +
+        `TO '${join(legacyDir, "data.parquet")}' (FORMAT PARQUET)`,
+    );
+    const r = await call({ from: "2026-01-16", to: "2026-01-16" });
+    expect(r.days.ok).toEqual([]);
+    expect(r.days.skippedExisting).toEqual([]);
+    expect(r.days.errors).toEqual([
+      { date: "2026-01-16", error: expect.stringContaining("cannot determine") },
+    ]);
+    expect(r.rowsWritten).toEqual({ chain: 0, quotes: 0 });
+    expect(existsSync(partitionFile("option_quote_minutes", "2026-01-16"))).toBe(false);
+  });
+
+  it("reads naive timestamps as America/New_York whatever the session time zone", async () => {
+    const naive = join(dataDir, "naive");
+    await writeNaiveDayFile(naive, "2026-01-16");
+    await getCurrentConnection().run("SET TimeZone = 'Asia/Tokyo'");
+    const r = await call({ path: naive, from: "2026-01-16", to: "2026-01-16", strikePct: 1 });
+    expect(r.days.ok).toEqual([{ date: "2026-01-16", chainRows: 2, quoteRows: 4 }]);
+    const times = (
+      await getCurrentConnection().runAndReadAll(
+        "SELECT DISTINCT time FROM market.option_quote_minutes WHERE underlying='SPX' ORDER BY time",
+      )
+    )
+      .getRows()
+      .map((row) => String(row[0]));
+    // parity needs the 09:35 ET rows, so a reference was found only if the zone is right
+    expect(times).toEqual(["09:35", "09:36"]);
+    const ns = await count(
+      "SELECT min(last_updated_ns) FROM market.option_quote_minutes WHERE underlying='SPX'",
+    );
+    expect(ns).toBe(Date.parse("2026-01-16T14:35:00Z") * 1e6);
+  });
 });
 
 describe("option-archive helpers", () => {
@@ -216,5 +341,10 @@ describe("option-archive helpers", () => {
     expect(strikeBand({}, null)).toBeNull();
     expect(strikeBand({ strikePct: 10 }, 100)).toEqual({ low: 90, high: 110 });
     expect(strikeBand({ strikePct: 10, strikeMin: 95 }, 100)).toEqual({ low: 95, high: 110 });
+  });
+  it("normalizes timestamp column types to an instant", () => {
+    expect(timestampInstantExpr("TIMESTAMP WITH TIME ZONE")).toBe(`"timestamp"`);
+    expect(timestampInstantExpr("TIMESTAMP_NS")).toContain("America/New_York");
+    expect(() => timestampInstantExpr("VARCHAR")).toThrow(/unsupported timestamp column type/);
   });
 });

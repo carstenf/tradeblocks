@@ -294,7 +294,7 @@ export function registerMarketFetchTools(
     {
       description:
         "Bulk-import 1-minute option quotes from a local Parquet archive (one file per trading day, e.g. a ThetaData dump) into market.option_chain and market.option_quote_minutes, filtered by date range, DTE range, calls/puts and a strike band. No provider is called.\n\n" +
-        "Archive contract: Parquet files whose path contains the trading day as YYYY-MM-DD, with columns expiration (YYYY-MM-DD), strike (dollars), right (C/P or CALL/PUT), timestamp (TIMESTAMPTZ), bid, ask, and optionally symbol (option root). " +
+        "Archive contract: Parquet files whose path contains the trading day as YYYY-MM-DD, with columns expiration (YYYY-MM-DD), strike (dollars), right (C/P or CALL/PUT), timestamp (TIMESTAMPTZ, or naive TIMESTAMP read as America/New_York), bid, ask, and optionally symbol (option root). " +
         "Per day it writes chain then quotes for partition (underlying, date) and compares the written row counts with a count of the same SELECT.\n\n" +
         "Each write REPLACES the whole (underlying, date) partition. onExisting='skip' (default) leaves days that already hold option data untouched, so a narrower slice can never delete a broader one and repeated calls resume where the last stopped; use 'replace' only to deliberately rewrite days (e.g. to widen a selection or fix a mismatched day). " +
         "Known XNYS closures (calendar 2022–2030) are never imported. Start with dryRun=true for the plan and a size estimate; large ranges are processed maxDays at a time and the rest is listed as remaining.",
@@ -329,7 +329,7 @@ export function registerMarketFetchTools(
           .enum(["european", "american"])
           .optional()
           .describe(
-            "Default: european for cash-settled index roots (SPX, SPXW, XSP, NDX, RUT, VIX), else american",
+            "Default: european when underlying or tickerRoot is a cash-settled index root (SPX, SPXW, XSP, NDX, NDXP, RUT, RUTW, VIX, DJX), else american; the file's symbol values do not affect it",
           ),
         onExisting: z
           .enum(["skip", "replace"])

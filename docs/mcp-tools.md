@@ -120,31 +120,37 @@ for example a ThetaData dump) into `market.option_chain` and
 **Archive contract.** Each file's path contains its trading day as `YYYY-MM-DD`
 (the last such date in the path is used). Columns: `expiration` (`YYYY-MM-DD`),
 `strike` (dollars), `right` (`C`/`P` or `CALL`/`PUT`), `timestamp`
-(`TIMESTAMPTZ`), `bid`, `ask`, and optionally `symbol` (the option root).
+(`TIMESTAMPTZ`, or a naive `TIMESTAMP` read as America/New_York wall-clock time; the result does not depend on the host time zone), `bid`, `ask`, and optionally `symbol` (the option root).
 
 **Parameters**
 
-| Parameter                | Default       | Meaning                                                                                                    |
-| ------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------- |
-| `path`                   | —             | Archive directory (searched recursively for `*.parquet`) or a glob                                         |
-| `from`, `to`             | —             | Trading-day range, `YYYY-MM-DD`                                                                            |
-| `underlying`             | —             | Target partition, e.g. `SPX`                                                                               |
-| `tickerRoot`             | file `symbol` | Root written into OCC tickers; falls back to `underlying` when the file has no `symbol` column             |
-| `dteMin`, `dteMax`       | `0`, `0`      | Calendar days to expiration                                                                                |
-| `rights`                 | `both`        | `both`, `call` or `put`                                                                                    |
-| `strikePct`              | —             | Keep strikes within ±pct of the day's reference: first `market.spot` bar, else put-call parity at 09:35 ET |
-| `strikeMin`, `strikeMax` | —             | Absolute strike bounds (combine with `strikePct`)                                                          |
-| `exerciseStyle`          | by root       | `european` for cash-settled index roots (SPX, SPXW, XSP, NDX, RUT, VIX), else `american`                   |
-| `onExisting`             | `skip`        | `skip` leaves days that already hold option data untouched; `replace` rewrites them                        |
-| `dryRun`                 | `false`       | Classify days and count rows on up to 5 sample days; writes nothing                                        |
-| `maxDays`                | `100`         | Days imported per call; the rest is returned in `days.remaining`                                           |
+| Parameter                | Default       | Meaning                                                                                                                                                                                  |
+| ------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`                   | —             | Archive directory (searched recursively for `*.parquet`) or a glob                                                                                                                       |
+| `from`, `to`             | —             | Trading-day range, `YYYY-MM-DD`                                                                                                                                                          |
+| `underlying`             | —             | Target partition, e.g. `SPX`                                                                                                                                                             |
+| `tickerRoot`             | file `symbol` | Root written into OCC tickers; falls back to `underlying` when the file has no `symbol` column                                                                                           |
+| `dteMin`, `dteMax`       | `0`, `0`      | Calendar days to expiration                                                                                                                                                              |
+| `rights`                 | `both`        | `both`, `call` or `put`                                                                                                                                                                  |
+| `strikePct`              | —             | Keep strikes within ±pct of the day's reference: first `market.spot` bar, else put-call parity at 09:35 ET                                                                               |
+| `strikeMin`, `strikeMax` | —             | Absolute strike bounds (combine with `strikePct`)                                                                                                                                        |
+| `exerciseStyle`          | by root       | `european` when `underlying` or `tickerRoot` is a cash-settled index root (SPX, SPXW, XSP, NDX, NDXP, RUT, RUTW, VIX, DJX), else `american`; the file's `symbol` values do not affect it |
+| `onExisting`             | `skip`        | `skip` leaves days that already hold option data untouched; `replace` rewrites them                                                                                                      |
+| `dryRun`                 | `false`       | Classify days and count rows on up to 5 sample days; writes nothing                                                                                                                      |
+| `maxDays`                | `100`         | Days imported per call; the rest is returned in `days.remaining`                                                                                                                         |
 
-**Behaviour.** Per day the tool writes the chain, then the quotes, for partition
+**Behaviour.** Per day the tool writes the quotes, then the chain, for partition
 `(underlying, date)` through `writeFromSelect` and compares the written row
-counts with a count of the same SELECT. A write replaces the **whole**
+counts with a count of the same SELECT. The pair is published together: if the
+quote write is refused (for example by the quote store's shrink guard) nothing
+is written, and if the chain write fails the quote partition is restored to its
+previous state (removed for a new day); either way the day is reported in
+`days.errors` and readers keep the previous complete day. A write replaces the **whole**
 partition, so the default `onExisting: "skip"` guarantees that importing a
 narrower slice never deletes a broader one, and repeated calls resume where the
-previous call stopped. Widen a selection (for example 0 DTE → 0–7 DTE) with
+previous call stopped. Existence is checked on the partition files; when it
+cannot be determined (an unreadable path, or a legacy date-only `option_chain`
+partition for the day) the day goes to `days.errors` and is not written. Widen a selection (for example 0 DTE → 0–7 DTE) with
 `onExisting: "replace"` over the days concerned. Known XNYS closures (session
 calendar 2022–2030) are never imported, even when the archive holds a file for
 them; before 2022 only weekends are excluded.
