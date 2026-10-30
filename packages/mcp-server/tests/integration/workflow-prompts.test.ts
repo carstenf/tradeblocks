@@ -163,6 +163,7 @@ const EXISTING_TOOL_NAMES = [
   "import_flat_file",
   "import_from_database",
   "import_market_csv",
+  "import_option_archive",
   "list_analysis_fields",
   "list_blocks",
   "list_daily_datasets",
