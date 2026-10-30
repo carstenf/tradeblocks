@@ -26,6 +26,12 @@ import {
   runtimeFieldCatalog,
 } from "../../db/dataset-schemas.ts";
 import { resolveStartingCapital } from "../../utils/starting-capital.ts";
+import {
+  PermutationWorkLimitConfigError,
+  minimumIterationsToReject,
+  permutationPowerWarning,
+  resolvePermutationWorkLimits,
+} from "../../utils/permutation-work-limits.ts";
 
 /**
  * Register predictive-related report tools
@@ -378,7 +384,23 @@ export function registerPredictiveTools(server: McpServer, baseDir: string): voi
                   }
                 : {}),
             });
+          let powerWarning: ReturnType<typeof permutationPowerWarning> = null;
           if (permutation) {
+            let limits: ReturnType<typeof resolvePermutationWorkLimits>;
+            try {
+              limits = resolvePermutationWorkLimits();
+            } catch (error) {
+              if (!(error instanceof PermutationWorkLimitConfigError)) throw error;
+              return createToolOutput(`Filter curve permutation refused: ${error.message}`, {
+                blockId,
+                status: "refused",
+                reason: "permutation_work_limit_config_invalid",
+                variable: error.variable,
+                value: error.value,
+                error: error.message,
+                permutation: { ...permutation, status: "refused" },
+              });
+            }
             if ((thresholds?.length ?? 0) > 100 || (percentileSteps?.length ?? 0) > 100)
               return createToolOutput(
                 "Filter curve permutation refused: permutation_candidate_limit",
@@ -411,12 +433,12 @@ export function registerPredictiveTools(server: McpServer, baseDir: string): voi
               estimatedWork: estimateWork(permutation.iterations),
             }));
             const estimatedWork = estimates.reduce((sum, field) => sum + field.estimatedWork, 0);
-            const overField = estimates.find((field) => field.estimatedWork > 30_000_000);
-            if (overField || estimatedWork > 90_000_000) {
+            const overField = estimates.find((field) => field.estimatedWork > limits.field);
+            if (overField || estimatedWork > limits.request) {
               let maxIterationsThatFit: number | null = null;
               for (let iterations = 499; iterations >= 1; iterations--) {
                 const fieldWork = estimateWork(iterations);
-                if (fieldWork <= 30_000_000 && fieldWork * names.length <= 90_000_000) {
+                if (fieldWork <= limits.field && fieldWork * names.length <= limits.request) {
                   maxIterationsThatFit = iterations;
                   break;
                 }
@@ -426,8 +448,10 @@ export function registerPredictiveTools(server: McpServer, baseDir: string): voi
                 status: "refused",
                 reason: overField ? "permutation_work_limit" : "permutation_request_work_limit",
                 estimatedWork: overField ? overField.estimatedWork : estimatedWork,
-                workLimit: overField ? 30_000_000 : 90_000_000,
+                workLimit: overField ? limits.field : limits.request,
+                workLimits: limits,
                 maxIterationsThatFit,
+                minimumIterationsToReject: minimumIterationsToReject(names.length),
                 ...(maxIterationsThatFit === null
                   ? { iterationsFitReason: "minimum_iterations_exceeds_work_limit" }
                   : {}),
@@ -435,6 +459,7 @@ export function registerPredictiveTools(server: McpServer, baseDir: string): voi
                 fields: estimates,
               });
             }
+            powerWarning = permutationPowerWarning(names.length, permutation.iterations);
           }
           const groupEntry = groupBy
             ? (await runtimeFieldCatalog(await getConnection(baseDir))).find(
@@ -560,12 +585,17 @@ export function registerPredictiveTools(server: McpServer, baseDir: string): voi
             endDate: endDate ?? null,
           };
           if (fields)
-            return createToolOutput(`Filter curves for ${names.length} fields`, {
-              blockId,
-              mode,
-              filters,
-              fields: results,
-            });
+            return createToolOutput(
+              `Filter curves for ${names.length} fields` +
+                (powerWarning ? ` | warning: ${powerWarning.message}` : ""),
+              {
+                blockId,
+                mode,
+                filters,
+                ...(powerWarning ? { warnings: [powerWarning] } : {}),
+                fields: results,
+              },
+            );
           const result = results[0];
           if ("status" in result && result.status === "refused")
             return createToolOutput(`Filter curve refused: ${result.reason}`, {
@@ -576,10 +606,12 @@ export function registerPredictiveTools(server: McpServer, baseDir: string): voi
             return { content: [{ type: "text", text: result.error }] };
           const { field: resultField, ...curve } = result;
           return createToolOutput(
-            `Filter curve for ${field}: ${result.thresholds.length} thresholds analyzed | ${result.sweetSpots.length} sweet spots found`,
+            `Filter curve for ${field}: ${result.thresholds.length} thresholds analyzed | ${result.sweetSpots.length} sweet spots found` +
+              (powerWarning ? ` | warning: ${powerWarning.message}` : ""),
             {
               blockId,
               field: resultField,
+              ...(powerWarning ? { warnings: [powerWarning] } : {}),
               ...datasetAgeOutput(resolved.datasetAge, [resultField]),
               mode,
               filters,

@@ -478,7 +478,29 @@ from 1 through 499 satisfying **both** limits for the unchanged request under th
 same estimator. Retry with that many iterations; changing any other input changes
 the estimate. If even one iteration cannot fit, the field is null and
 `iterationsFitReason: "minimum_iterations_exceeds_work_limit"` explains why.
-No block count is calculated for admission refusals. Other refusals return requested
+Work-limit refusals also report `workLimits` (the effective per-field and per-request
+limits and whether each came from the default or the environment) and
+`minimumIterationsToReject` for the requested family.
+No block count is calculated for admission refusals.
+
+**Configurable work limits.** A self-hosted server can raise both limits with
+`TRADEBLOCKS_PERMUTATION_WORK_LIMIT` (per field, default 30,000,000) and
+`TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT` (per request, default 90,000,000), in work
+units as estimated above. Unset, the server behaves exactly as before. Each value must be
+a positive integer written in plain digits; anything else refuses the permutation with
+`permutation_work_limit_config_invalid`, naming the variable and its value, instead of
+falling back to the default. The variables are read on every call.
+
+**Power warning.** A permutation p-value cannot fall below 1/(B+1) for B iterations, and
+Holm multiplies the smallest of m p-values by m, so the best achievable adjusted p-value is
+m/(B+1). When the admitted `iterations` give m/(B+1) ≥ 0.05, the response carries
+`warnings: [{ code: "permutation_cannot_reject", familySize, iterations, alpha,
+smallestAdjustedPValue, minimumIterations, minimumIterationsAllowed, message }]`: no field
+can reach p < 0.05, so a non-significant result is **not** evidence against the filter.
+`minimumIterations` is the smallest B with m/(B+1) < 0.05 (20 for one field, 80 for four);
+`minimumIterationsAllowed` is false when that exceeds the 499-iteration cap, in which case
+test fewer fields per request. For example, four risk-objective fields on about 1,100 days
+admit at most 65 iterations under the default limits, a floor of 4/66 ≈ 0.061. Other refusals return requested
 iterations, block, seed, block count and status.
 These exploratory p-values adjust threshold/field selection within this request.
 Choices of **field, objective and mode across separate requests are not part of the

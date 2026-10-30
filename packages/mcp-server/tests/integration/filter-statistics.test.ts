@@ -1343,3 +1343,98 @@ test("kept-share floor restricts observed and shuffled selection without hiding 
   for (const minKeptFraction of [0, -0.1, 1.01])
     expect(schemas.filter_curve.safeParse({ ...input, minKeptFraction }).success).toBe(false);
 });
+
+test("permutation work limits are configurable, refuse invalid values by name, and warn below the Holm floor", async () => {
+  await fixture(
+    Array.from({ length: 1100 }, (_, i) => ({
+      date: `${2022 + Math.floor(i / 240)}-${String((Math.floor(i / 20) % 12) + 1).padStart(2, "0")}-${String((i % 20) + 1).padStart(2, "0")}`,
+      pl: Math.floor(i / 20) % 2 ? 100 : -100,
+      signal: Math.floor(i / 20) % 2,
+      noise: i % 20,
+      trend: i,
+    })),
+  );
+  const request = {
+    blockId: "sample",
+    fields: ["custom.signal", "custom.noise", "custom.trend", "openingPrice"],
+    mode: "both",
+    unit: "day",
+    objective: "sharpe",
+    percentileSteps: [5, 10, 25, 50, 75, 90, 95],
+  };
+  const permutation = (iterations: number) => ({ iterations, block: "month", seed: 42 });
+  const saved = {
+    field: process.env.TRADEBLOCKS_PERMUTATION_WORK_LIMIT,
+    request: process.env.TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT,
+  };
+  const restore = () => {
+    for (const [name, value] of [
+      ["TRADEBLOCKS_PERMUTATION_WORK_LIMIT", saved.field],
+      ["TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT", saved.request],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  };
+  try {
+    delete process.env.TRADEBLOCKS_PERMUTATION_WORK_LIMIT;
+    delete process.env.TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT;
+
+    // Default path: unchanged refusal, now reporting the effective limits.
+    const refused = (await handlers.filter_curve({ ...request, permutation: permutation(499) }))
+      .structuredContent!;
+    expect(refused).toMatchObject({
+      status: "refused",
+      reason: "permutation_work_limit",
+      workLimit: 30_000_000,
+      workLimits: {
+        field: 30_000_000,
+        request: 90_000_000,
+        source: { field: "default", request: "default" },
+      },
+      minimumIterationsToReject: 80,
+    });
+    const fit = refused.maxIterationsThatFit as number;
+    expect(fit).toBeLessThan(80);
+
+    // The largest admitted request under the defaults cannot reject: warned, with the minimum.
+    const floored = (await handlers.filter_curve({ ...request, permutation: permutation(fit) }))
+      .structuredContent!;
+    expect(floored.status).not.toBe("refused");
+    expect(floored.warnings).toEqual([
+      expect.objectContaining({
+        code: "permutation_cannot_reject",
+        familySize: 4,
+        iterations: fit,
+        minimumIterations: 80,
+      }),
+    ]);
+
+    // A raised limit admits a request the defaults refuse (fit < 80 < 100); 100 iterations can reject.
+    process.env.TRADEBLOCKS_PERMUTATION_WORK_LIMIT = "200000000";
+    process.env.TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT = "800000000";
+    const admitted = (await handlers.filter_curve({ ...request, permutation: permutation(100) }))
+      .structuredContent!;
+    expect(admitted.status).not.toBe("refused");
+    expect(admitted).not.toHaveProperty("warnings");
+    const fields = admitted.fields as FieldResult[];
+    expect(fields).toHaveLength(4);
+    // With enough iterations the planted signal clears Holm, which the default limits ruled out.
+    const signal = fields.find((field) => field.field === "custom.signal")!;
+    expect(signal.permutation).toMatchObject({ status: "ok", iterations: 100 });
+    expect(signal.permutation.pValueHolm).toBeLessThan(0.05);
+
+    // Invalid values refuse by name instead of falling back to the default.
+    process.env.TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT = "lots";
+    const invalid = (await handlers.filter_curve({ ...request, permutation: permutation(10) }))
+      .structuredContent!;
+    expect(invalid).toMatchObject({
+      status: "refused",
+      reason: "permutation_work_limit_config_invalid",
+      variable: "TRADEBLOCKS_PERMUTATION_REQUEST_WORK_LIMIT",
+      value: "lots",
+    });
+  } finally {
+    restore();
+  }
+}, 180_000);
