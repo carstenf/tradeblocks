@@ -521,6 +521,7 @@ such as `calculatedAt`, sync times, and market-feed timestamps, remain ISO times
 | `import_market_csv`          | Import market data CSV with column mapping                                          |
 | `import_from_database`       | Import from external DuckDB databases                                               |
 | `import_flat_file`           | Import a local Parquet or CSV flat file for a ticker/timespan                       |
+| `import_option_archive`      | Bulk-import option chain + quotes from a local Parquet day-file archive             |
 | `fetch_bars`                 | Fetch daily or intraday OHLCV bars from configured provider                         |
 | `fetch_quotes`               | Fetch option minute quotes from configured provider                                 |
 | `fetch_chain`                | Fetch option chain snapshot for an underlying on a given date                       |

@@ -95,20 +95,80 @@ Live fallback values do not imply that a revision-bearing quote was persisted.
 
 ## Market Data Import
 
-| Tool                   | Description                                                                                        |
-| ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `import_market_csv`    | Import OHLCV data from a local CSV file with column mapping                                        |
-| `import_from_database` | Import from an external DuckDB database via SQL query                                              |
-| `import_flat_file`     | Import a local Parquet or CSV flat file for a specific ticker and timespan                         |
-| `fetch_bars`           | Fetch daily or intraday OHLCV bars from the configured provider and write to Parquet               |
-| `fetch_quotes`         | Fetch option minute quotes from the configured provider and write to Parquet                       |
-| `fetch_chain`          | Fetch option chain snapshot for an underlying on a given date                                      |
-| `compute_vix_context`  | Compute cross-ticker VIX regime fields (Vol_Regime, Term_Structure_State, etc.) for a date range   |
-| `refresh_market_data`  | Composite daily refresh: fetch bars for all tickers, auto-fire VIX context, return coverage report |
-| `enrich_market_data`   | Run enrichment pipeline to compute derived indicators                                              |
-| `purge_market_table`   | Delete all data from a market table for re-import                                                  |
+| Tool                    | Description                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `import_market_csv`     | Import OHLCV data from a local CSV file with column mapping                                                   |
+| `import_from_database`  | Import from an external DuckDB database via SQL query                                                         |
+| `import_flat_file`      | Import a local Parquet or CSV flat file for a specific ticker and timespan                                    |
+| `import_option_archive` | Bulk-import option chain + minute quotes from a local Parquet day-file archive, filtered and verified per day |
+| `fetch_bars`            | Fetch daily or intraday OHLCV bars from the configured provider and write to Parquet                          |
+| `fetch_quotes`          | Fetch option minute quotes from the configured provider and write to Parquet                                  |
+| `fetch_chain`           | Fetch option chain snapshot for an underlying on a given date                                                 |
+| `compute_vix_context`   | Compute cross-ticker VIX regime fields (Vol_Regime, Term_Structure_State, etc.) for a date range              |
+| `refresh_market_data`   | Composite daily refresh: fetch bars for all tickers, auto-fire VIX context, return coverage report            |
+| `enrich_market_data`    | Run enrichment pipeline to compute derived indicators                                                         |
+| `purge_market_table`    | Delete all data from a market table for re-import                                                             |
 
 See [Market Data Guide](market-data.md) for import examples, ticker formats, and enrichment details.
+
+### import_option_archive
+
+Loads a slice of a local option-quote archive (one Parquet file per trading day,
+for example a ThetaData dump) into `market.option_chain` and
+`market.option_quote_minutes` without calling a provider.
+
+**Archive contract.** Each file's path contains its trading day as `YYYY-MM-DD`
+(the last such date in the path is used). Columns: `expiration` (`YYYY-MM-DD`),
+`strike` (dollars), `right` (`C`/`P` or `CALL`/`PUT`), `timestamp`
+(`TIMESTAMPTZ`, or a naive `TIMESTAMP` read as America/New_York wall-clock time; the result does not depend on the host time zone), `bid`, `ask`, and optionally `symbol` (the option root).
+
+**Parameters**
+
+| Parameter                | Default       | Meaning                                                                                                                                                                                  |
+| ------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`                   | —             | Archive directory (searched recursively for `*.parquet`) or a glob                                                                                                                       |
+| `from`, `to`             | —             | Trading-day range, `YYYY-MM-DD`                                                                                                                                                          |
+| `underlying`             | —             | Target partition, e.g. `SPX`                                                                                                                                                             |
+| `tickerRoot`             | file `symbol` | Root written into OCC tickers; falls back to `underlying` when the file has no `symbol` column                                                                                           |
+| `dteMin`, `dteMax`       | `0`, `0`      | Calendar days to expiration                                                                                                                                                              |
+| `rights`                 | `both`        | `both`, `call` or `put`                                                                                                                                                                  |
+| `strikePct`              | —             | Keep strikes within ±pct of the day's reference: first `market.spot` bar, else put-call parity at 09:35 ET                                                                               |
+| `strikeMin`, `strikeMax` | —             | Absolute strike bounds (combine with `strikePct`)                                                                                                                                        |
+| `exerciseStyle`          | by root       | `european` when `underlying` or `tickerRoot` is a cash-settled index root (SPX, SPXW, XSP, NDX, NDXP, RUT, RUTW, VIX, DJX), else `american`; the file's `symbol` values do not affect it |
+| `onExisting`             | `skip`        | `skip` leaves days that already hold option data untouched; `replace` rewrites them                                                                                                      |
+| `dryRun`                 | `false`       | Classify days and count rows on up to 5 sample days; writes nothing                                                                                                                      |
+| `maxDays`                | `100`         | Days imported per call; the rest is returned in `days.remaining`                                                                                                                         |
+
+**Behaviour.** Per day the tool writes the quotes, then the chain, for partition
+`(underlying, date)` through `writeFromSelect` and compares the written row
+counts with a count of the same SELECT. On a failed write the day is restored: if the
+quote write is refused (for example by the quote store's shrink guard) nothing
+is written, and if the chain write fails the quote partition is restored to its
+previous state (removed for a new day); either way the day is reported in
+`days.errors` and readers keep the previous complete day. Quotes and chain are two
+separate file renames, so a reader can briefly see the new quotes with the old chain,
+and a process killed between them leaves a half-written day that `skip` reports as
+present; run `onExisting: "replace"` over such a day to repair it. A write replaces the **whole**
+partition, so the default `onExisting: "skip"` guarantees that importing a
+narrower slice never deletes a broader one, and repeated calls resume where the
+previous call stopped. Existence is checked on the partition files; when it
+cannot be determined (an unreadable path, or a legacy date-only `option_chain`
+partition for the day) the day goes to `days.errors` and is not written. Widen a selection (for example 0 DTE → 0–7 DTE) with
+`onExisting: "replace"` over the days concerned. Known XNYS closures (session
+calendar 2022–2030) are never imported, even when the archive holds a file for
+them; before 2022 only weekends are excluded.
+
+**Result.** `days.ok`, `days.planned` (dry run), `days.skippedExisting`,
+`days.missingInArchive`, `days.nonTradingDays`, `days.noMatchingRows`,
+`days.noReferencePrice`, `days.unclassifiedDays` (imported weekdays outside the
+2022–2030 calendar, where a holiday is not recognised), `days.offDateRows` (days whose
+selected rows include timestamps on another New York date than the file path; the
+rows are still written under the path date), `days.mismatched` (expected vs written counts),
+`days.errors`, `days.remaining`, `rowsWritten`, `strikeReference` (per day with
+`strikePct`: `spot_open` or `parity` and the price used), and for a dry run an
+`estimate` extrapolated from the sampled days. `status` is `partial` when any
+day mismatched, failed or remains. A mismatched day has been written; re-run it
+with `onExisting: "replace"`.
 
 For stored Greeks populated by `fetch_quotes`, see the
 [computed option-Greeks method](market-data.md#computed-option-greeks-method).
